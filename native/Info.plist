@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>ai.stepfun.step-voice.audio</string>
+    <key>CFBundleName</key>
+    <string>Step Voice Audio</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Step Voice 使用麦克风进行语音交流，并将通话音频发送到你配置的 StepFun 语音服务。</string>
+</dict>
+</plist>

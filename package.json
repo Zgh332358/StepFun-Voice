@@ -1,0 +1,39 @@
+{
+	"name": "step-voice",
+	"version": "0.1.0",
+	"description": "StepFun voice chat plugin connected to the current Step Code agent",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"stepcode",
+		"voice",
+		"stepfun"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test test/*.test.mjs"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"dependencies": {
+		"ws": "8.21.3"
+	},
+	"peerDependencies": {
+		"@step-harness/coding-agent": "*",
+		"@step-harness/pi-tui": "*"
+	},
+	"peerDependenciesMeta": {
+		"@step-harness/coding-agent": {
+			"optional": true
+		},
+		"@step-harness/pi-tui": {
+			"optional": true
+		}
+	},
+	"private": true
+}
