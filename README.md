@@ -19,10 +19,32 @@ step install -l git:github.com/Zgh332358/StepFun-Voice
 
 # 启动前在同一个终端设置 Key。
 export STEP_API_KEY='你的 StepFun API Key'
+
+# 可选：以下是默认模型和音色；按需替换右侧的值。
+export STEP_VOICE_REALTIME_MODEL='stepaudio-3-realtime-preview'
+export STEP_VOICE_TTS_MODEL='stepaudio-3-tts'
+export STEP_VOICE_VOICE='linjiajiejie'
+
 step
 ```
 
 然后输入 `/voice`，按 Enter 开始语音。Step Code 会 clone 仓库、安装运行依赖并注册扩展。安装仅注册插件，麦克风在用户明确开始语音后启用。
+
+### 默认模型与修改配置
+
+不设置模型和音色环境变量时，插件自动使用以下默认值：
+
+| 配置项 | 默认值 | 环境变量 |
+| --- | --- | --- |
+| 实时语音交流：理解、回复、字幕及任务委派 | `stepaudio-3-realtime-preview` | `STEP_VOICE_REALTIME_MODEL` |
+| 后台任务结果的语音播报 | `stepaudio-3-tts` | `STEP_VOICE_TTS_MODEL` |
+| 语音音色 | `linjiajiejie` | `STEP_VOICE_VOICE` |
+
+要修改配置，将上面安装示例中对应 `export` 右侧的值替换为你 StepFun 账号可用的模型或音色，再从**同一个终端**运行 `step`。如果 Step Code 已经运行，先退出，再设置变量并重新启动；在另一个终端执行 `export` 不会更新已有进程。启动后用 `/voice config`，或在语音面板按 S，查看当前配置。
+
+编码与文件、终端任务沿用 **Step Code 当前选择的模型**，不由这些语音变量指定。代码还提供默认型号为 `stepaudio-3-asr-max` 的独立 ASR helper，可通过 `STEP_VOICE_ASR_MODEL` 修改；当前通话的理解和字幕由 Realtime 完成，不使用这个独立 ASR 路径。
+
+### 管理安装
 
 不带 `-l` 时安装到用户范围，可用于其他项目。当前项目引用保存在 `.stepcode/config.toml`；用户引用保存在 `~/.stepcode/config.toml`，由 Step Code 管理。安装后重新启动 Step Code，或通过 `/reload` 重载。查看、更新和卸载：
 
@@ -123,7 +145,7 @@ export STEP_API_KEY='你的 Key'
 export STEP_VOICE_REALTIME_MODEL='stepaudio-3-realtime-preview'
 export STEP_VOICE_TTS_MODEL='stepaudio-3-tts'
 export STEP_VOICE_VOICE='linjiajiejie'
-pnpm step -e ./plugins/step-voice/index.ts
+step
 ```
 
 | 环境变量 | 默认值 | 用途 |
