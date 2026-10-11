@@ -48,11 +48,24 @@ export class NativeAudioEngine {
     this.muted = false;
   }
 
-  async start() {
-    if (this.child) return;
+  start() {
+    if (this.pendingStart) return this.pendingStart.promise;
+    if (this.child) return Promise.resolve();
     const epoch = ++this.epoch;
-    const binary = this.options.binaryPath ?? await prepareNativeAudio();
+    const pending = {};
+    const cancelled = new Promise((_, reject) => { pending.cancel = () => reject(new Error('音频启动已取消。')); });
+    pending.promise = Promise.race([this.startForEpoch(epoch), cancelled]).finally(() => {
+      if (this.pendingStart === pending) this.pendingStart = undefined;
+    });
+    this.pendingStart = pending;
+    return pending.promise;
+  }
+
+  async startForEpoch(epoch) {
+    this.hooks.onStatus?.('preparing');
+    const binary = this.options.binaryPath ?? await (this.options.prepareImpl ?? prepareNativeAudio)();
     if (epoch !== this.epoch) return;
+    this.hooks.onStatus?.('permission');
     const spawnImpl = this.options.spawnImpl ?? spawn;
     const child = spawnImpl(binary, [], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '', TMPDIR: process.env.TMPDIR ?? tmpdir(), LANG: process.env.LANG ?? 'en_US.UTF-8' } });
     this.child = child;
@@ -75,7 +88,7 @@ export class NativeAudioEngine {
         let event;
         try { event = JSON.parse(line); } catch { this.hooks.onError?.(new Error('音频助手返回了无效事件。')); return; }
         switch (event.type) {
-          case 'ready': finish(); this.setMuted(this.muted); break;
+          case 'ready': this.hooks.onStatus?.('ready'); finish(); this.setMuted(this.muted); break;
           case 'audio': if (!this.muted) this.hooks.onAudio?.(event.audio); break;
           case 'level': this.hooks.onLevel?.(this.muted ? 0 : event.value); break;
           case 'playback': this.hooks.onPlayback?.(Boolean(event.active)); break;
@@ -106,6 +119,8 @@ export class NativeAudioEngine {
   setMuted(muted) { this.muted = Boolean(muted); this.write({ type: 'mute', muted: this.muted }); if (this.muted) this.hooks.onLevel?.(0); }
   async stop() {
     this.epoch++;
+    this.pendingStart?.cancel();
+    this.pendingStart = undefined;
     this.rejectStart?.(new Error('音频启动已取消。'));
     const child = this.child;
     this.child = undefined;

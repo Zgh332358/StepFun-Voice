@@ -449,28 +449,42 @@ export class StepFunRealtimeClient {
 	}
 }
 
+function abortable(promise, signal) {
+	if (!signal) return promise;
+	if (signal.aborted) {
+		void Promise.resolve(promise).catch(() => {});
+		return Promise.reject(signal.reason || new Error("语音请求已取消。"));
+	}
+	return new Promise((resolve, reject) => {
+		const onAbort = () => reject(signal.reason || new Error("语音请求已取消。"));
+		signal.addEventListener("abort", onAbort, { once: true });
+		Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+	});
+}
+
 async function authorizedFetch(config, path, body, { fetchImpl, signal }) {
 	if (!config.apiKey) throw new Error("请配置 STEP_API_KEY 或 STEPFUN_API_KEY。");
 	let response;
 	try {
-		response = await fetchImpl(`${config.baseUrl}${path}`, {
+		signal?.throwIfAborted();
+		response = await abortable(fetchImpl(`${config.baseUrl}${path}`, {
 			method: "POST",
 			headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", Accept: "text/event-stream" },
 			body: JSON.stringify(body),
 			signal,
-		});
+		}), signal);
 	} catch (error) {
 		throw new Error(sanitizeProviderError(error, config.apiKey));
 	}
 	if (!response.ok) {
-		const detail = await response.text();
+		const detail = await abortable(response.text(), signal);
 		throw new Error(`StepFun HTTP ${response.status}: ${sanitizeProviderError(detail, config.apiKey)}`);
 	}
 	return response;
 }
 
 /** Handles UTF-8, CRLF, multi-line data and arbitrary network chunk boundaries. */
-export async function* readSseEvents(body) {
+export async function* readSseEvents(body, { signal, onChunk = () => {} } = {}) {
 	if (!body) throw new Error("StepFun SSE 响应缺少流。");
 	const decoder = new TextDecoder();
 	let pending = "";
@@ -480,63 +494,111 @@ export async function* readSseEvents(body) {
 			if (dataLines.length) {
 				const data = dataLines.join("\n");
 				dataLines = [];
-				if (data === "[DONE]") return;
+				signal?.throwIfAborted();
+				if (data === "[DONE]") return true;
+				let event;
 				try {
-					yield JSON.parse(data);
+					event = JSON.parse(data);
 				} catch {
 					throw new Error("StepFun SSE 返回了无效 JSON。");
 				}
+				// A single transport chunk can contain several events. Re-check after
+				// each consumer resumes so cancellation fences already-buffered data.
+				signal?.throwIfAborted();
+				yield event;
 			}
 		} else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
 	};
-	for await (const chunk of body) {
-		pending += decoder.decode(chunk, { stream: true });
-		let newline;
-		while ((newline = pending.indexOf("\n")) !== -1) {
-			const line = pending.slice(0, newline).replace(/\r$/, "");
-			pending = pending.slice(newline + 1);
-			yield* consume(line);
+	const reader = typeof body.getReader === "function" ? body.getReader() : null;
+	const iterator = reader ? null : body[Symbol.asyncIterator]();
+	try {
+		while (true) {
+			signal?.throwIfAborted();
+			const { value: chunk, done } = await abortable(reader ? reader.read() : iterator.next(), signal);
+			if (done) break;
+			onChunk();
+			pending += decoder.decode(chunk, { stream: true });
+			let newline;
+			while ((newline = pending.indexOf("\n")) !== -1) {
+				const line = pending.slice(0, newline).replace(/\r$/, "");
+				pending = pending.slice(newline + 1);
+				if (yield* consume(line)) return;
+			}
+		}
+		pending += decoder.decode();
+		if (pending && (yield* consume(pending.replace(/\r$/, "")))) return;
+		yield* consume("");
+	} finally {
+		// Logical completion or cancellation must release a still-open HTTP body.
+		// Do not await transport cleanup: a stalled transport must not stall teardown.
+		if (reader) {
+			void reader.cancel().catch(() => {});
+			reader.releaseLock();
+		} else if (iterator.return) {
+			void Promise.resolve(iterator.return()).catch(() => {});
 		}
 	}
-	pending += decoder.decode();
-	if (pending) yield* consume(pending.replace(/\r$/, ""));
-	yield* consume("");
 }
 
 /** Optional segmented TTS route; the primary full-duplex model synthesizes natively. */
-export async function synthesizeSpeech(config, text, { fetchImpl = globalThis.fetch, onAudio = () => {}, signal } = {}) {
+export async function synthesizeSpeech(config, text, { fetchImpl = globalThis.fetch, onAudio = () => {}, signal, timeoutMs = 30_000 } = {}) {
 	if (typeof text !== "string" || !text.trim() || Array.from(text).length > 1_000) {
 		throw new Error("StepFun TTS 文本必须为 1 到 1000 字符。");
 	}
-	const response = await authorizedFetch(
-		config,
-		"/audio/speech",
-		{
-			model: config.ttsModel,
-			input: text,
-			voice: config.voice,
-			response_format: "pcm",
-			sample_rate: REALTIME_SAMPLE_RATE,
-			stream_format: "sse",
-			instruction: "自然、清晰、简短地说话，语气温暖，像面对面交谈。",
-			markdown_filter: true,
-		},
-		{ fetchImpl, signal },
-	);
-	const audio = [];
-	let done = false;
-	for await (const event of readSseEvents(response.body)) {
-		if (event.type === "speech.audio.delta") {
-			const chunk = Buffer.from(event.audio || "", "base64");
-			audio.push(chunk);
-			await onAudio(chunk, { sampleRate: REALTIME_SAMPLE_RATE, format: "pcm16" });
-		} else if (event.type === "speech.audio.done") done = true;
-		else if (event.type === "speech.audio.error" || event.type === "error") {
-			throw new Error(sanitizeProviderError(event.message || event.error?.message || "StepFun TTS 生成失败。", config.apiKey));
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("StepFun TTS 超时时间必须大于 0 毫秒。");
+	const request = new AbortController();
+	let timer;
+	const refreshTimeout = () => {
+		clearTimeout(timer);
+		timer = setTimeout(() => request.abort(new Error("StepFun TTS 等待语音数据超时，请检查网络后重试。")), timeoutMs);
+	};
+	const onAbort = () => request.abort(signal.reason || new Error("语音请求已取消。"));
+	if (signal?.aborted) onAbort();
+	else signal?.addEventListener("abort", onAbort, { once: true });
+	refreshTimeout();
+	try {
+		const response = await authorizedFetch(
+			config,
+			"/audio/speech",
+			{
+				model: config.ttsModel,
+				input: text,
+				voice: config.voice,
+				response_format: "pcm",
+				sample_rate: REALTIME_SAMPLE_RATE,
+				stream_format: "sse",
+				instruction: "自然、清晰、简短地说话，语气温暖，像面对面交谈。",
+				markdown_filter: true,
+			},
+			{ fetchImpl, signal: request.signal },
+		);
+		refreshTimeout();
+		const audio = [];
+		let done = false;
+		for await (const event of readSseEvents(response.body, { signal: request.signal, onChunk: refreshTimeout })) {
+			request.signal.throwIfAborted();
+			if (event.type === "speech.audio.delta") {
+				const chunk = Buffer.from(event.audio || "", "base64");
+				audio.push(chunk);
+				request.signal.throwIfAborted();
+				await abortable(onAudio(chunk, { sampleRate: REALTIME_SAMPLE_RATE, format: "pcm16" }), request.signal);
+			} else if (event.type === "speech.audio.done") {
+				done = true;
+				break;
+			} else if (event.type === "speech.audio.error" || event.type === "error") {
+				throw new Error(sanitizeProviderError(event.message || event.error?.message || "StepFun TTS 生成失败。", config.apiKey));
+			}
 		}
+		if (!done) throw new Error("StepFun TTS 流在完成前关闭。");
+		request.signal.throwIfAborted();
+		return { audio: Buffer.concat(audio), format: "pcm16", sampleRate: REALTIME_SAMPLE_RATE };
+	} catch (error) {
+		throw new Error(sanitizeProviderError(error, config.apiKey));
+	} finally {
+		clearTimeout(timer);
+		signal?.removeEventListener("abort", onAbort);
+		request.abort();
 	}
-	if (!done) throw new Error("StepFun TTS 流在完成前关闭。");
-	return { audio: Buffer.concat(audio), format: "pcm16", sampleRate: REALTIME_SAMPLE_RATE };
 }
 
 /** Optional turn-based ASR upload. PCM callers must supply the real recording rate. */

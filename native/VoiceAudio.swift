@@ -85,6 +85,9 @@ final class VoiceAudio {
         }
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: playbackFormat)
+        // Voice I/O requires matching input/output client formats. The mixer
+        // converts the 24 kHz player stream to the microphone's format.
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self = self else { return }
             do {

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { once } from 'node:events';
 import { WebSocket } from 'ws';
 import { startVoiceServer, speechSummary } from '../src/server.mjs';
@@ -108,6 +109,41 @@ test('missing key prompts configuration without opening upstream', async (t) => 
   const error = await peer.wait((event) => event.type === 'error');
   assert.match(error.message, /STEP_API_KEY/);
   assert.equal(providers.length, 0);
+});
+
+test('voice events carry session identity and a delayed old stop cannot stop the restarted session', async (t) => {
+  const { client, providers } = await fixture(t);
+  const peer = await client();
+  peer.send({ type: 'voice.start', voiceSessionId: 'first' });
+  await peer.wait(event => event.type === 'voice.state' && event.state === 'ready' && event.voiceSessionId === 'first');
+  peer.send({ type: 'voice.stop', voiceSessionId: 'first' });
+  await peer.wait(event => event.type === 'voice.state' && event.state === 'stopped' && event.voiceSessionId === 'first');
+  peer.send({ type: 'voice.start', voiceSessionId: 'second' });
+  await peer.wait(event => event.type === 'voice.state' && event.state === 'ready' && event.voiceSessionId === 'second');
+  peer.send({ type: 'voice.stop', voiceSessionId: 'first' });
+  providers[1].hooks.onEvent({ type: 'output.audio.delta', audio: 'AAA=', responseId: 'second-response' });
+  const audio = await peer.wait(event => event.type === 'output.audio.delta');
+  assert.equal(audio.voiceSessionId, 'second');
+  await pause();
+  assert.equal(providers[1].closed, false);
+  assert.equal(peer.messages.some(event => event.type === 'voice.state' && event.state === 'stopped' && event.voiceSessionId === 'second'), false);
+  peer.send({ type: 'voice.stop', voiceSessionId: 'second' });
+  await peer.wait(event => event.type === 'voice.state' && event.state === 'stopped' && event.voiceSessionId === 'second');
+  assert.equal(providers[1].closed, true);
+});
+
+test('relay teardown closes an unfinished HTTP transport rather than leaving reload pending', async (t) => {
+  const { handle, url } = await fixture(t);
+  const socket = net.connect({ host: '127.0.0.1', port: Number(url.port) });
+  t.after(() => socket.destroy());
+  await once(socket, 'connect');
+  socket.write(`GET /healthz HTTP/1.1\r\nHost: ${url.host}\r\n`);
+  const closed = once(socket, 'close');
+  await pause(10);
+  await handle.close();
+  await closed;
+  assert.equal(socket.destroyed, true);
+  assert.equal((await fetch(`${url.origin}/healthz`).catch(() => null)), null);
 });
 
 test('malformed HTTP request targets return 400 and leave the relay healthy', async (t) => {

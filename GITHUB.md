@@ -92,7 +92,7 @@ step
 
 本地目录需要已有运行依赖；在插件目录执行 `npm ci --ignore-scripts`，再加载即可。这里的 npm 仅安装 Node 运行依赖，不注册账号、不发布插件。GitHub 安装路径由宿主自动完成依赖安装。
 
-从插件源码目录运行 `STEP_CODE_SOURCE=/path/to/Step-Code npm test` 做完整离线验证，替换为已安装依赖的 Step Code 源码 checkout。该变量仅用于测试，从 GitHub 安装插件时不需要；正常运行的宿主 loader 提供 TUI 模块。真实语音还需要在 macOS 上验证物理麦克风、StepFun Realtime、TTS、延迟和回声抑制。当前交付未使用真实 Key 完成这些验收。
+从插件源码目录运行 `STEP_CODE_SOURCE=/path/to/Step-Code npm test` 做完整离线验证，替换为已安装依赖的 Step Code 源码 checkout。该变量仅用于测试，从 GitHub 安装插件时不需要；正常运行的宿主 loader 提供 TUI 模块。默认 Realtime 和 TTS 已通过真实请求，macOS 实际采集、播放与回声消除，以及 Step Code 0.1.3 的连续启停已做短测试。长时间真人交流、多设备和噪声环境的体验仍需验证，具体范围见 [README](README.md#验证与当前边界)。
 
 ## 官方参考
 

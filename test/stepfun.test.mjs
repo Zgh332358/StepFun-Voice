@@ -68,6 +68,20 @@ function sseResponse(events, { fragmentSize = 3, status = 200 } = {}) {
 	);
 }
 
+function openSseResponse(t, content) {
+	let streamController;
+	let canceled = 0;
+	const body = new ReadableStream({
+		start(controller) {
+			streamController = controller;
+			if (content) controller.enqueue(new TextEncoder().encode(content));
+		},
+		cancel() { canceled++; },
+	});
+	t.after(() => { try { streamController.close(); } catch { /* Already canceled. */ } });
+	return { response: new Response(body), body, enqueue: (text) => streamController.enqueue(new TextEncoder().encode(text)), canceled: () => canceled };
+}
+
 test("config uses StepFun models, explicit key precedence and mono 24 kHz realtime", () => {
 	const result = loadStepFunConfig({ STEP_API_KEY: "preferred", STEPFUN_API_KEY: "secondary" });
 	assert.equal(result.apiKey, "preferred");
@@ -361,6 +375,15 @@ test("SSE decoder preserves fragmented UTF-8 and handles CRLF + multi-line data"
 	assert.deepEqual(items, [{ type: "done", value: 1 }]);
 });
 
+test("SSE DONE ends a still-open body, discards trailing bytes and releases its reader", { timeout: 1_000 }, async (t) => {
+	const stream = openSseResponse(t, 'data: {"type":"first"}\n\ndata: [DONE]\n\ndata: invalid-json\n\n');
+	const events = [];
+	for await (const event of readSseEvents(stream.body)) events.push(event);
+	assert.deepEqual(events, [{ type: "first" }]);
+	assert.equal(stream.canceled(), 1);
+	assert.equal(stream.body.locked, false);
+});
+
 test("StepAudio 3 TTS sends official SSE schema, decodes each chunk and excludes voice_label", async () => {
 	const outputs = [];
 	let request;
@@ -392,6 +415,128 @@ test("TTS bounds input before API calls and detects an incomplete SSE stream", a
 		synthesizeSpeech(config(), "hello", { fetchImpl: async () => sseResponse([{ type: "speech.audio.delta", audio: "AAA=" }]) }),
 		/完成前关闭/,
 	);
+});
+
+test("TTS completes on speech.audio.done without waiting for DONE or HTTP EOF", { timeout: 1_000 }, async (t) => {
+	const stream = openSseResponse(t, 'data: {"type":"speech.audio.delta","audio":"AQACAA=="}\n\ndata: {"type":"speech.audio.done","audio":""}\n\ndata: {"type":"speech.audio.delta","audio":"AwA="}\n\n');
+	const chunks = [];
+	const result = await synthesizeSpeech(config(), "完成了。", { fetchImpl: async () => stream.response, onAudio: (audio) => chunks.push(audio) });
+	assert.deepEqual(result.audio, Buffer.from([1, 0, 2, 0]));
+	assert.equal(chunks.length, 1);
+	assert.equal(stream.canceled(), 1);
+	assert.equal(stream.body.locked, false);
+});
+
+test("TTS cancellation while releasing a completed reader cannot return success", { timeout: 1_000 }, async () => {
+	const abort = new AbortController();
+	let canceled = 0;
+	const body = new ReadableStream({
+		start(controller) { controller.enqueue(new TextEncoder().encode('data: {"type":"speech.audio.done"}\n\n')); },
+		cancel() {
+			canceled++;
+			abort.abort(new Error("完成时已打断"));
+		},
+	});
+	await assert.rejects(synthesizeSpeech(config(), "你好。", { signal: abort.signal, fetchImpl: async () => new Response(body) }), /完成时已打断/);
+	assert.equal(canceled, 1);
+	assert.equal(body.locked, false);
+});
+
+test("TTS DONE without audio.done fails promptly and cancels a still-open body", { timeout: 1_000 }, async (t) => {
+	const stream = openSseResponse(t, 'data: {"type":"speech.audio.delta","audio":"AAA="}\n\ndata: [DONE]\n\n');
+	await assert.rejects(synthesizeSpeech(config(), "你好。", { fetchImpl: async () => stream.response }), /完成前关闭/);
+	assert.equal(stream.canceled(), 1);
+	assert.equal(stream.body.locked, false);
+});
+
+test("TTS error cancels an open body and keeps provider credentials out of errors", { timeout: 1_000 }, async (t) => {
+	const stream = openSseResponse(t, `data: ${JSON.stringify({ type: "speech.audio.error", message: `denied ${config().apiKey}` })}\n\n`);
+	await assert.rejects(synthesizeSpeech(config(), "你好。", { fetchImpl: async () => stream.response }), (error) => !error.message.includes(config().apiKey) && error.message.includes("redacted"));
+	assert.equal(stream.canceled(), 1);
+	assert.equal(stream.body.locked, false);
+});
+
+test("TTS pre-cancellation makes no request and cancellation interrupts stalled headers", { timeout: 1_000 }, async () => {
+	const before = new AbortController();
+	before.abort(new Error("已打断"));
+	let requests = 0;
+	await assert.rejects(synthesizeSpeech(config(), "你好。", { signal: before.signal, fetchImpl: async () => { requests++; return new Response(); } }), /已打断/);
+	assert.equal(requests, 0);
+	const during = new AbortController();
+	let requestSignal;
+	const pending = synthesizeSpeech(config(), "你好。", { signal: during.signal, fetchImpl: (_, options) => { requestSignal = options.signal; return new Promise(() => {}); } });
+	during.abort(new Error("已打断"));
+	await assert.rejects(pending, /已打断/);
+	assert.equal(requestSignal.aborted, true);
+});
+
+test("TTS cancellation interrupts a stalled reader and releases it without trailing audio", { timeout: 1_000 }, async (t) => {
+	const stream = openSseResponse(t, 'data: {"type":"speech.audio.delta","audio":"AAA="}\n\n');
+	const abort = new AbortController();
+	let markAudio;
+	const heardAudio = new Promise((resolve) => { markAudio = resolve; });
+	const pending = synthesizeSpeech(config(), "你好。", { signal: abort.signal, fetchImpl: async () => stream.response, onAudio: () => markAudio() });
+	await heardAudio;
+	abort.abort(new Error(`停止 ${config().apiKey}`));
+	await assert.rejects(pending, (error) => error.message.includes("停止") && !error.message.includes(config().apiKey));
+	assert.equal(stream.canceled(), 1);
+	assert.equal(stream.body.locked, false);
+});
+
+test("SSE cancellation between events in one network chunk prevents the next yield", { timeout: 1_000 }, async (t) => {
+	const stream = openSseResponse(t, 'data: {"type":"first"}\n\ndata: {"type":"second"}\n\n');
+	const abort = new AbortController();
+	const received = [];
+	await assert.rejects(async () => {
+		for await (const event of readSseEvents(stream.body, { signal: abort.signal })) {
+			received.push(event.type);
+			abort.abort(new Error("已打断"));
+		}
+	}, /已打断/);
+	assert.deepEqual(received, ["first"]);
+	assert.equal(stream.canceled(), 1);
+	assert.equal(stream.body.locked, false);
+});
+
+test("TTS cancellation after the first callback prevents the second audio callback in the same chunk", { timeout: 1_000 }, async (t) => {
+	const stream = openSseResponse(t, 'data: {"type":"speech.audio.delta","audio":"AQA="}\n\ndata: {"type":"speech.audio.delta","audio":"AgA="}\n\ndata: {"type":"speech.audio.done"}\n\n');
+	const abort = new AbortController();
+	const received = [];
+	await assert.rejects(synthesizeSpeech(config(), "你好。", {
+		fetchImpl: async () => stream.response,
+		signal: abort.signal,
+		onAudio(audio) {
+			received.push(audio);
+			if (received.length === 1) {
+				// Abort after the callback promise settles, before the parser yields the
+				// next buffered event. This reproduces the original microtask race.
+				queueMicrotask(() => queueMicrotask(() => abort.abort(new Error("已打断"))));
+			}
+		},
+	}), /已打断/);
+	assert.deepEqual(received, [Buffer.from([1, 0])]);
+	assert.equal(stream.canceled(), 1);
+	assert.equal(stream.body.locked, false);
+});
+
+test("TTS times out while waiting for headers or the next audio chunk", { timeout: 1_000 }, async (t) => {
+	let requestSignal;
+	await assert.rejects(synthesizeSpeech(config(), "你好。", { timeoutMs: 20, fetchImpl: (_, options) => { requestSignal = options.signal; return new Promise(() => {}); } }), /超时/);
+	assert.equal(requestSignal.aborted, true);
+	const stream = openSseResponse(t, 'data: {"type":"speech.audio.delta","audio":"AAA="}\n\n');
+	await assert.rejects(synthesizeSpeech(config(), "你好。", { timeoutMs: 20, fetchImpl: async () => stream.response }), /超时/);
+	assert.equal(stream.canceled(), 1);
+	assert.equal(stream.body.locked, false);
+});
+
+test("TTS refreshes its idle timeout on incoming bytes rather than total synthesis duration", { timeout: 1_000 }, async (t) => {
+	const stream = openSseResponse(t, ': heartbeat\n\n');
+	const timers = [];
+	for (let i = 1; i <= 6; i++) timers.push(setTimeout(() => stream.enqueue(i === 6 ? 'data: {"type":"speech.audio.done"}\n\n' : ': heartbeat\n\n'), i * 20));
+	t.after(() => { for (const timer of timers) clearTimeout(timer); });
+	const result = await synthesizeSpeech(config(), "你好。", { timeoutMs: 80, fetchImpl: async () => stream.response });
+	assert.equal(result.audio.length, 0);
+	assert.equal(stream.canceled(), 1);
 });
 
 test("StepAudio 3 ASR sends actual PCM rate and returns final corrected transcript", async () => {

@@ -73,3 +73,29 @@ test('native helper startup errors surface rather than claiming a live microphon
   assert.deepEqual(errors, ['麦克风权限未开启']);
   await f.audio.stop();
 });
+
+test('stop settles startup during compilation without waiting for preparation or launching a late helper', async () => {
+  let resolvePreparation;
+  let launches = 0;
+  const states = [];
+  const audio = new NativeAudioEngine({ onStatus: (state) => states.push(state) }, {
+    prepareImpl: () => new Promise(resolve => { resolvePreparation = resolve; }),
+    spawnImpl: () => { launches++; throw new Error('late launch'); },
+  });
+  const pending = audio.start();
+  const rejected = assert.rejects(pending, /已取消/);
+  await audio.stop();
+  await rejected;
+  assert.deepEqual(states, ['preparing']);
+  resolvePreparation('/test/audio-helper');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(launches, 0);
+});
+
+test('native startup exposes audio preparation and permission stages before readiness', async () => {
+  const states = [];
+  const fixture = nativeFixture({ onStatus: (state) => states.push(state) });
+  await fixture.start();
+  assert.deepEqual(states, ['preparing', 'permission', 'ready']);
+  await fixture.audio.stop();
+});

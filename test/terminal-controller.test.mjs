@@ -7,7 +7,16 @@ const URL = `http://127.0.0.1:9999/#${"a".repeat(43)}`;
 const PCM = Buffer.from([0, 0, 0, 64, 0, 128]).toString("base64");
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-function runtime({ keyConfigured = true, agentConnected = true, start = async () => {} } = {}) {
+async function settlesWithin(promise, timeoutMs = 250) {
+	let timer;
+	try {
+		await Promise.race([promise, new Promise((_resolve, reject) => {
+			timer = setTimeout(() => reject(new Error("Operation did not settle after cancellation or timeout")), timeoutMs);
+		})]);
+	} finally { clearTimeout(timer); }
+}
+
+function runtime({ keyConfigured = true, agentConnected = true, start = async () => {}, factory, controllerOptions = {} } = {}) {
 	const sockets = [];
 	const engines = [];
 	class Socket extends EventEmitter {
@@ -18,7 +27,7 @@ function runtime({ keyConfigured = true, agentConnected = true, start = async ()
 		close() { this.readyState = 3; this.emit("close"); }
 	}
 	const controller = createTerminalVoiceController({
-		url: URL, WebSocketImpl: Socket,
+		url: URL, WebSocketImpl: Socket, ...controllerOptions,
 		audioFactory: (hooks) => {
 			const engine = { hooks, starts: 0, stops: 0, clears: 0, played: [], muted: [],
 				async start() { this.starts++; await start(); },
@@ -27,7 +36,7 @@ function runtime({ keyConfigured = true, agentConnected = true, start = async ()
 				setMuted(value) { this.muted.push(value); },
 				async stop() { this.stops++; hooks.onClosed(); },
 			};
-			engines.push(engine); return engine;
+			engines.push(engine); return factory ? factory(engine) : engine;
 		},
 	});
 	const emit = (event) => sockets[0].emit("message", Buffer.from(JSON.stringify(event)));
@@ -154,7 +163,10 @@ test("stop during pending native permission prevents a late voice.start and tear
 	let resume;
 	const r = runtime({ start: () => new Promise((resolve) => { resume = resolve; }) });
 	await r.ready(); const starting = r.controller.start(); await tick();
-	await r.controller.stop(); resume(); await starting;
+	await r.controller.stop();
+	// Cancellation must settle the caller before the original native readiness resolves.
+	await settlesWithin(starting);
+	resume(); await tick();
 	assert.equal(r.messages.some((message) => message.type === "voice.start"), false);
 	assert.ok(r.engines[0].stops >= 1);
 	assert.equal(r.controller.snapshot().voice, "stopped");
@@ -209,4 +221,221 @@ test("late cancellation of an old response cannot split the new streaming transc
 	assert.equal(r.controller.snapshot().transcripts[0].text, "新的回复");
 	assert.equal(r.controller.snapshot().transcripts[0].final, false);
 	await r.controller.dispose();
+});
+
+test("cancelled startup releases its caller and permits immediate retry even if native start never resolves", async () => {
+	let attempts = 0;
+	const r = runtime({ start: () => ++attempts === 1 ? new Promise(() => {}) : Promise.resolve() });
+	await r.ready(); const first = r.controller.start(); await tick();
+	await r.controller.stop(); await settlesWithin(first);
+	assert.equal(r.controller.snapshot().voice, "stopped");
+	await settlesWithin(r.controller.start()); r.emit({ type: "voice.state", state: "ready" });
+	assert.equal(attempts, 2); assert.equal(r.controller.snapshot().voice, "ready");
+	assert.equal(r.messages.filter((message) => message.type === "voice.start").length, 1);
+	assert.equal(r.messages.some((message) => message.type === "agent.cancel"), false);
+	await r.controller.dispose();
+});
+
+test("cancellation during delayed audio factory settles immediately and disposes the late adapter without starting it", async () => {
+	let finishFactory;
+	const r = runtime({ factory: (engine) => new Promise((resolve) => { finishFactory = () => resolve(engine); }) });
+	await r.ready(); const starting = r.controller.start(); await tick();
+	assert.equal(r.controller.snapshot().startupPhase, "preparing-audio");
+	await r.controller.stop(); await settlesWithin(starting);
+	finishFactory(); await tick(); await tick();
+	assert.equal(r.engines[0].starts, 0); assert.ok(r.engines[0].stops >= 1);
+	assert.equal(r.messages.some((message) => message.type === "voice.start"), false);
+	await r.controller.dispose();
+});
+
+test("audio factory timeout ends startup and also disposes an adapter that arrives afterward", async () => {
+	let finishFactory;
+	const r = runtime({ controllerOptions: { audioStartTimeoutMs: 10 }, factory: (engine) => new Promise((resolve) => { finishFactory = () => resolve(engine); }) });
+	await r.ready(); await settlesWithin(r.controller.start());
+	assert.equal(r.controller.snapshot().voice, "error"); assert.equal(r.controller.snapshot().startupPhase, "error");
+	assert.match(r.controller.snapshot().notice.text, /本机音频.*超时/);
+	finishFactory(); await tick(); await tick();
+	assert.equal(r.engines[0].starts, 0); assert.ok(r.engines[0].stops >= 1);
+	await r.controller.dispose();
+});
+
+test("permanently pending native readiness times out, closes capture and never claims an upstream session", async () => {
+	const r = runtime({ start: () => new Promise(() => {}), controllerOptions: { audioStartTimeoutMs: 10 } });
+	await r.ready(); await settlesWithin(r.controller.start());
+	assert.equal(r.controller.snapshot().voice, "error"); assert.equal(r.controller.snapshot().startupPhase, "error");
+	assert.ok(r.engines[0].stops >= 1); assert.match(r.controller.snapshot().notice.text, /超时/);
+	assert.equal(r.messages.some((message) => message.type === "voice.start" || message.type === "agent.cancel"), false);
+	await r.controller.dispose();
+});
+
+test("missing upstream readiness has a bounded failure transition and closes the microphone without cancelling host work", async () => {
+	const r = runtime({ controllerOptions: { modelReadyTimeoutMs: 10 } });
+	await r.ready(); await r.controller.start();
+	assert.equal(r.controller.snapshot().startupPhase, "connecting-model");
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(r.controller.snapshot().voice, "error"); assert.equal(r.controller.snapshot().startupPhase, "error");
+	assert.match(r.controller.snapshot().notice.text, /StepFun.*就绪超时/);
+	assert.ok(r.engines[0].stops >= 1);
+	assert.ok(r.messages.some((message) => message.type === "voice.stop"));
+	assert.equal(r.messages.some((message) => message.type === "agent.cancel"), false);
+	await r.controller.dispose();
+});
+
+test("native progress distinguishes preparation, microphone permission and model readiness", async () => {
+	let finishNative;
+	const r = runtime({ start: () => new Promise((resolve) => { finishNative = resolve; }) });
+	await r.ready(); const starting = r.controller.start(); await tick();
+	r.engines[0].hooks.onStatus("preparing", "正在编译音频助手");
+	assert.equal(r.controller.snapshot().startupPhase, "preparing-audio");
+	r.engines[0].hooks.onStatus("permission", "等待系统麦克风权限");
+	assert.equal(r.controller.snapshot().startupPhase, "opening-microphone");
+	r.engines[0].hooks.onStatus("ready"); finishNative(); await starting;
+	assert.equal(r.controller.snapshot().startupPhase, "connecting-model");
+	assert.equal(r.controller.snapshot().voice, "connecting");
+	r.emit({ type: "voice.state", state: "ready" });
+	assert.equal(r.controller.snapshot().startupPhase, "ready");
+	await r.controller.stop(); assert.equal(r.controller.snapshot().startupPhase, "idle");
+	await r.controller.dispose();
+});
+
+for (const source of ["server-stopped", "server-error", "native-error", "native-closed"]) {
+	test(`late cleanup from ${source} cannot overwrite a newly ready audio generation`, async () => {
+		const r = runtime(); await r.startReady();
+		let finishOldStop;
+		r.engines[0].stop = async () => { r.engines[0].stops++; await new Promise((resolve) => { finishOldStop = resolve; }); };
+		if (source === "server-stopped") r.emit({ type: "voice.state", state: "stopped" });
+		else if (source === "server-error") r.emit({ type: "voice.state", state: "error" });
+		else if (source === "native-error") r.engines[0].hooks.onError(new Error("old engine failed"));
+		else r.engines[0].hooks.onClosed();
+		await tick(); await r.controller.start(); r.emit({ type: "voice.state", state: "ready" });
+		finishOldStop(); await tick();
+		assert.equal(r.controller.snapshot().voice, "ready");
+		assert.equal(r.controller.snapshot().startupPhase, "ready");
+		assert.equal(r.controller.snapshot().notice, undefined);
+		await r.controller.dispose();
+	});
+}
+
+test("playback clear and WebSocket send errors cannot prevent native microphone cleanup", async () => {
+	const r = runtime(); await r.startReady();
+	r.engines[0].clear = () => { throw new Error("queue overloaded"); };
+	const originalSend = r.sockets[0].send.bind(r.sockets[0]);
+	r.sockets[0].send = (data) => {
+		if (JSON.parse(data).type === "voice.stop") throw new Error("socket write failed");
+		originalSend(data);
+	};
+	await r.controller.stop();
+	assert.ok(r.engines[0].stops >= 1);
+	assert.equal(r.controller.snapshot().voice, "stopped");
+	assert.equal(r.controller.snapshot().startupPhase, "idle");
+	assert.match(r.controller.snapshot().notice.text, /queue overloaded.*socket write failed/);
+	assert.equal(r.messages.some((message) => message.type === "agent.cancel"), false);
+	await r.controller.dispose();
+});
+
+test("a stuck third-party native stop is bounded and produces an honest failure state", async () => {
+	const r = runtime({ controllerOptions: { audioStopTimeoutMs: 10 } }); await r.startReady();
+	r.engines[0].stop = () => new Promise(() => {});
+	await settlesWithin(r.controller.stop());
+	assert.equal(r.controller.snapshot().voice, "error"); assert.equal(r.controller.snapshot().startupPhase, "error");
+	assert.match(r.controller.snapshot().notice.text, /音频.*停止超时/);
+	await r.controller.dispose();
+});
+
+test("a late ready event after local cancellation cannot claim a live microphone session", async () => {
+	const r = runtime(); await r.ready(); await r.controller.start(); await r.controller.stop();
+	r.emit({ type: "voice.state", state: "ready" });
+	assert.equal(r.controller.snapshot().voice, "stopped"); assert.equal(r.controller.snapshot().startupPhase, "idle");
+	await r.controller.dispose();
+});
+
+test("cancellation on the microphone-stage update prevents its queued native start from opening capture", async () => {
+	const r = runtime(); await r.ready();
+	let cancelling;
+	const unsubscribe = r.controller.subscribe((snapshot) => {
+		if (snapshot.startupPhase === "opening-microphone" && !cancelling) cancelling = r.controller.stop();
+	});
+	await settlesWithin(r.controller.start()); await cancelling;
+	assert.equal(r.engines[0].starts, 0); assert.ok(r.engines[0].stops >= 1);
+	assert.equal(r.controller.snapshot().voice, "stopped");
+	assert.equal(r.messages.some((message) => message.type === "voice.start"), false);
+	unsubscribe(); await r.controller.dispose();
+});
+
+test("each explicit start identifies its session and stop retains that identity until restart", async () => {
+	const r = runtime(); await r.ready(); await r.controller.start();
+	const firstId = r.messages.at(-1).voiceSessionId;
+	assert.match(firstId, /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+	r.emit({ type: "voice.state", state: "ready", voiceSessionId: firstId });
+	await r.controller.stop(); assert.equal(r.messages.at(-1).voiceSessionId, firstId);
+	await r.controller.stop(); assert.equal(r.messages.at(-1).voiceSessionId, firstId);
+	await r.controller.start();
+	const secondId = r.messages.at(-1).voiceSessionId;
+	assert.notEqual(secondId, firstId);
+	r.emit({ type: "voice.state", state: "ready", voiceSessionId: secondId });
+	assert.equal(r.controller.snapshot().voice, "ready");
+	assert.equal(r.messages.some((message) => message.type === "agent.cancel"), false);
+	await r.controller.dispose();
+});
+
+test("late stopped acknowledgements and other frames from an old voice session cannot tear down or contaminate a new session", async () => {
+	const r = runtime(); await r.ready(); await r.controller.start();
+	const oldId = r.messages.at(-1).voiceSessionId;
+	r.emit({ type: "voice.state", state: "ready", voiceSessionId: oldId });
+	await r.controller.stop(); await r.controller.start();
+	const currentId = r.messages.at(-1).voiceSessionId;
+	// The old stop acknowledgement can arrive before the new provider's ready frame as well.
+	r.emit({ type: "voice.state", state: "stopped", voiceSessionId: oldId });
+	r.emit({ type: "voice.state", state: "ready", voiceSessionId: oldId });
+	assert.equal(r.controller.snapshot().voice, "connecting"); assert.equal(r.engines[1].stops, 0);
+	r.emit({ type: "voice.state", state: "ready", voiceSessionId: currentId });
+	r.emit({ type: "response.started", responseId: "current-response", voiceSessionId: currentId });
+	r.emit({ type: "output.transcript.delta", responseId: "current-response", text: "当前回复", voiceSessionId: currentId });
+	r.emit({ type: "output.audio.delta", responseId: "current-response", audio: PCM, voiceSessionId: currentId });
+	r.engines[1].hooks.onLevel(.6);
+	const before = r.controller.snapshot();
+	const clearCount = r.engines[1].clears;
+	const frames = [
+		{ type: "voice.state", state: "stopped" },
+		{ type: "voice.state", state: "error" },
+		{ type: "voice.state", state: "connecting" },
+		{ type: "voice.state", state: "ready" },
+		{ type: "speech.start" }, { type: "speech.end" }, { type: "audio.clear" },
+		{ type: "response.started", responseId: "old-response" },
+		{ type: "input.transcript.final", text: "旧的识别结果" },
+		{ type: "output.transcript.delta", responseId: "old-response", text: "旧的字幕" },
+		{ type: "output.transcript.final", responseId: "old-response", text: "旧的字幕终稿" },
+		{ type: "output.audio.delta", responseId: "old-response", audio: PCM },
+		{ type: "response.done", status: "failed", statusDetails: { error: { message: "old failure" } } },
+		{ type: "error", message: "old socket failure" }, { type: "closed" },
+	];
+	for (const frame of frames) {
+		r.emit({ ...frame, voiceSessionId: oldId });
+		assert.deepEqual(r.controller.snapshot(), before, `stale ${frame.type} must be ignored`);
+	}
+	await tick();
+	assert.equal(r.engines[1].stops, 0); assert.equal(r.engines[1].clears, clearCount);
+	assert.equal(r.engines[1].played.length, 1);
+	// Matching stop acknowledgements must still close the current capture adapter.
+	r.emit({ type: "voice.state", state: "stopped", voiceSessionId: currentId }); await tick();
+	assert.equal(r.controller.snapshot().voice, "stopped"); assert.equal(r.engines[1].stops, 1);
+	assert.equal(r.messages.some((message) => message.type === "agent.cancel"), false);
+	await r.controller.dispose();
+});
+
+test("a synchronous restart during the stop snapshot cannot change the identity of the outgoing old stop", async () => {
+	const r = runtime(); await r.startReady();
+	const oldId = r.messages.find((message) => message.type === "voice.start").voiceSessionId;
+	let restarting;
+	const unsubscribe = r.controller.subscribe((snapshot) => {
+		if (snapshot.startupPhase === "stopping" && !restarting) restarting = r.controller.start();
+	});
+	await r.controller.stop(); await restarting;
+	const stopMessage = r.messages.find((message) => message.type === "voice.stop");
+	const newStart = r.messages.filter((message) => message.type === "voice.start").at(-1);
+	assert.equal(stopMessage.voiceSessionId, oldId);
+	assert.notEqual(newStart.voiceSessionId, oldId);
+	r.emit({ type: "voice.state", state: "ready", voiceSessionId: newStart.voiceSessionId });
+	assert.equal(r.controller.snapshot().voice, "ready");
+	unsubscribe(); await r.controller.dispose();
 });

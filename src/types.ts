@@ -53,6 +53,7 @@ export interface TerminalVoiceConfig {
 export interface TerminalVoiceSnapshot {
 	connection: "disconnected" | "connecting" | "connected";
 	voice: "stopped" | "connecting" | "ready" | "error";
+	startupPhase?: "idle" | "preparing-audio" | "opening-microphone" | "connecting-model" | "ready" | "stopping" | "error";
 	muted: boolean;
 	micLevel: number;
 	speaking: boolean;

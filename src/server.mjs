@@ -100,8 +100,9 @@ export async function startVoiceServer(options = {}) {
     }
     client.send(JSON.stringify(redactEvent(event, config)));
   }
+  function sendVoice(session, event) { send(session.client, { ...event, voiceSessionId: session.voiceSessionId }); }
   function broadcast(event) { for (const client of clients) send(client, event); }
-  function failure(client, error, code = 'voice_error') { send(client, { type: 'error', code, message: redact(error?.message ?? error, config) }); }
+  function failure(client, error, code = 'voice_error', voiceSessionId) { send(client, { type: 'error', code, voiceSessionId, message: redact(error?.message ?? error, config) }); }
 
   function clearSpeech(session) {
     if (!session) return;
@@ -109,17 +110,17 @@ export async function startVoiceServer(options = {}) {
     session.ttsAbort = undefined;
     session.speechEpoch++;
     session.audioInterrupted = true;
-    send(session.client, { type: 'audio.clear' });
+    sendVoice(session, { type: 'audio.clear' });
   }
 
-  function stopSession(client, state = 'stopped') {
-    if (!active || (client && active.client !== client)) return;
+  function stopSession(client, state = 'stopped', expectedId) {
+    if (!active || (client && active.client !== client) || (expectedId && active.voiceSessionId !== expectedId)) return;
     const session = active;
     active = undefined;
     clearSpeech(session);
     for (const timer of session.requests.values()) clearTimeout(timer);
     session.provider?.close();
-    send(session.client, { type: 'voice.state', state });
+    sendVoice(session, { type: 'voice.state', state });
   }
 
   async function speakTask(event) {
@@ -142,23 +143,23 @@ export async function startVoiceServer(options = {}) {
     const abort = new AbortController();
     session.ttsAbort = abort;
     const responseId = `task-${event.requestId}`;
-    send(session.client, { type: 'response.started', responseId, source: 'tts' });
-    send(session.client, { type: 'output.transcript.final', text, itemId: responseId, responseId, source: 'tts' });
+    sendVoice(session, { type: 'response.started', responseId, source: 'tts' });
+    sendVoice(session, { type: 'output.transcript.final', text, itemId: responseId, responseId, source: 'tts' });
     try {
       await tts(config, text, {
         signal: abort.signal,
         onAudio: (audio, metadata) => {
           if (active !== session || epoch !== session.speechEpoch || abort.signal.aborted) return;
           const bytes = Buffer.isBuffer(audio) ? audio : Buffer.from(audio);
-          send(session.client, { type: 'output.audio.delta', audio: bytes.toString('base64'), sampleRate: metadata?.sampleRate ?? 24000, source: 'tts', responseId });
+          sendVoice(session, { type: 'output.audio.delta', audio: bytes.toString('base64'), sampleRate: metadata?.sampleRate ?? 24000, source: 'tts', responseId });
         },
       });
       if (active === session && epoch === session.speechEpoch && !abort.signal.aborted) {
-        send(session.client, { type: 'output.audio.done', responseId, source: 'tts' });
-        send(session.client, { type: 'response.done', responseId, source: 'tts' });
+        sendVoice(session, { type: 'output.audio.done', responseId, source: 'tts' });
+        sendVoice(session, { type: 'response.done', responseId, source: 'tts' });
       }
     } catch (error) {
-      if (!abort.signal.aborted && active === session) failure(session.client, error, 'tts_error');
+      if (!abort.signal.aborted && active === session) failure(session.client, error, 'tts_error', session.voiceSessionId);
     } finally {
       if (session.ttsAbort === abort) session.ttsAbort = undefined;
     }
@@ -170,7 +171,7 @@ export async function startVoiceServer(options = {}) {
       if (active !== session || !session.requests.has(result.requestId)) return;
       if (agent.snapshot().busy || agent.snapshot().pending || agent.snapshot().waitingForApproval) return;
       session.requests.delete(result.requestId);
-      failure(session.client, new Error('任务已提交，但 Step Code 尚未开始执行。请查看终端中的登录、模型或权限提示。'), 'agent_not_started');
+      failure(session.client, new Error('任务已提交，但 Step Code 尚未开始执行。请查看终端中的登录、模型或权限提示。'), 'agent_not_started', session.voiceSessionId);
     }, options.taskStartTimeoutMs ?? 45000);
     timer.unref?.();
     session.requests.set(result.requestId, timer);
@@ -191,15 +192,16 @@ export async function startVoiceServer(options = {}) {
       if (active.client !== client) throw new Error('已有一个语音面板正在通话，请先结束该通话。');
       stopSession(client);
     }
+    if (message.voiceSessionId !== undefined && (typeof message.voiceSessionId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(message.voiceSessionId))) throw new Error('语音会话标识无效。');
     config = configUpdate(config, message.config);
     if (typeof message.settings?.speakTasks === 'boolean') settings.speakTasks = message.settings.speakTasks;
     if (!config.apiKey) {
-      send(client, { type: 'voice.state', state: 'error' });
+      send(client, { type: 'voice.state', state: 'error', voiceSessionId: message.voiceSessionId });
       throw new Error('尚未配置 StepFun Key。请在启动 Step Code 的终端设置 STEP_API_KEY 或 STEPFUN_API_KEY，再重新启动。');
     }
-    const session = { client, provider: undefined, ready: false, speechEpoch: 0, audioInterrupted: false, requests: new Map() };
+    const session = { client, voiceSessionId: message.voiceSessionId, provider: undefined, ready: false, speechEpoch: 0, audioInterrupted: false, requests: new Map() };
     active = session;
-    send(client, { type: 'voice.state', state: 'connecting' });
+    sendVoice(session, { type: 'voice.state', state: 'connecting' });
     const onToolCall = async (call) => {
       if (active !== session) return { error: 'voice_session_closed' };
       if (!agentConnected) return { error: 'stepcode_not_connected' };
@@ -230,18 +232,18 @@ export async function startVoiceServer(options = {}) {
       if (event.type === 'output.audio.delta' && (session.audioInterrupted || session.ttsAbort)) return;
       if (event.type === 'ready') {
         session.ready = true;
-        send(client, { type: 'voice.state', state: 'ready' });
+        sendVoice(session, { type: 'voice.state', state: 'ready' });
       }
       if (event.type === 'closed') {
         stopSession(client);
         return;
       }
       if (event.type === 'error') {
-        send(client, { ...event, message: redact(event.message, config) });
+        sendVoice(session, { ...event, message: redact(event.message, config) });
         if (!session.ready) stopSession(client, 'error');
         return;
       }
-      send(client, event);
+      sendVoice(session, event);
     };
     try {
       session.provider = providerFactory(config, { delegate: agentConnected, onEvent, onToolCall });
@@ -250,6 +252,7 @@ export async function startVoiceServer(options = {}) {
     catch (error) { if (active === session) { stopSession(client, 'error'); throw error; } }
   }
 
+  const connections = new Set();
   const server = http.createServer(async (request, response) => {
     const host = request.headers.host;
     if (!address || host !== `127.0.0.1:${address.port}`) { response.writeHead(403).end('Invalid Host'); return; }
@@ -264,6 +267,12 @@ export async function startVoiceServer(options = {}) {
     if (pathname === '/healthz') { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify({ ok: true, agentConnected })); return; }
     if (pathname === '/') { response.setHeader('Content-Type', 'text/plain; charset=utf-8'); response.end('Step Voice terminal relay. Open /voice inside Step Code.'); return; }
     response.writeHead(404).end('Not found');
+  });
+  // Upgraded sockets can outlive ws.close() in a Bun-compiled host. Own the
+  // transport sockets so /voice stop and extension reload also close HTTP.
+  server.on('connection', (socket) => {
+    connections.add(socket);
+    socket.once('close', () => connections.delete(socket));
   });
   const wss = new WebSocketServer({ noServer: true, maxPayload: 192 * 1024, handleProtocols: (protocols) => protocols.has('step-voice') ? 'step-voice' : false });
   server.on('upgrade', (request, socket, head) => {
@@ -286,7 +295,7 @@ export async function startVoiceServer(options = {}) {
       if (disposed || !clients.has(client) || client.readyState !== WebSocket.OPEN) return;
       switch (message.type) {
         case 'voice.start': await startSession(client, message); break;
-        case 'voice.stop': stopSession(client); break;
+        case 'voice.stop': stopSession(client, 'stopped', message.voiceSessionId); break;
         case 'voice.interrupt':
           if (active?.client === client) { clearSpeech(active); active.provider.cancelResponse(); }
           break;
@@ -330,7 +339,7 @@ export async function startVoiceServer(options = {}) {
         // Stop and barge-in must not wait for an upstream connection attempt.
         if (['voice.stop', 'voice.interrupt', 'agent.cancel'].includes(message.type)) {
           if (message.type === 'voice.stop') generation++;
-          void handle(message).catch((error) => failure(client, error)); return;
+          void handle(message).catch((error) => failure(client, error, 'voice_error', message.voiceSessionId)); return;
         }
         const submittedGeneration = generation;
         controlQueue = controlQueue.then(() => {
@@ -359,6 +368,8 @@ export async function startVoiceServer(options = {}) {
       unsubscribe();
       stopSession();
       for (const client of clients) client.terminate();
+      for (const socket of connections) socket.destroy();
+      server.closeAllConnections?.();
       await new Promise((done) => wss.close(done));
       await new Promise((done) => server.close(done));
     },

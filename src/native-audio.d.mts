@@ -5,10 +5,11 @@ export interface NativeAudioHooks {
   onError?: (error: Error) => void;
   onNotice?: (message: string) => void;
   onClosed?: () => void;
+  onStatus?: (status: 'preparing' | 'permission' | 'ready') => void;
 }
 export function prepareNativeAudio(): Promise<string>;
 export class NativeAudioEngine {
-  constructor(hooks?: NativeAudioHooks, options?: { binaryPath?: string; spawnImpl?: any; readyTimeoutMs?: number });
+  constructor(hooks?: NativeAudioHooks, options?: { binaryPath?: string; prepareImpl?: () => Promise<string>; spawnImpl?: any; readyTimeoutMs?: number });
   start(): Promise<void>;
   play(audio: string, sampleRate?: number): void;
   clear(): void;

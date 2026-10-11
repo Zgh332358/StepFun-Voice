@@ -4,6 +4,8 @@ import { registerHooks } from "node:module";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { EventEmitter } from "node:events";
+import { createTerminalVoiceController } from "../src/terminal-controller.ts";
 
 // The source checkout exposes the same TUI module through the extension loader.
 // Installed hosts resolve the peer normally; source tests use its actual source.
@@ -134,5 +136,48 @@ test("typed tasks preserve an explicit follow-up delivery choice through the nat
 		r.panel.handleInput("检查语音插件"); r.panel.handleInput("\r"); await tick();
 		assert.deepEqual(r.calls.tasks, [{ text: "检查语音插件", delivery: "followUp" }]);
 		assert.deepEqual(r.calls.text, []);
+	} finally { r.panel.dispose(); }
+});
+
+test("real controller cancellation releases the panel for repeated starts while native startup never settles", async () => {
+	let socket;
+	let starts = 0;
+	const messages = [];
+	class Socket extends EventEmitter {
+		readyState = 1;
+		constructor() { super(); socket = this; }
+		send(raw) { messages.push(JSON.parse(raw)); }
+		close() { this.readyState = 3; this.emit("close"); }
+	}
+	const controller = createTerminalVoiceController({
+		url: `http://127.0.0.1:9999/#${"a".repeat(43)}`, WebSocketImpl: Socket,
+		audioFactory: () => ({ start: () => { starts++; return new Promise(() => {}); }, stop: async () => {}, clear() {}, setMuted() {}, play() {} }),
+	});
+	const connected = controller.connect();
+	socket.emit("message", JSON.stringify({ type: "server.ready", config: { keyConfigured: true } }));
+	await connected;
+	const agent = { sessionId: "session", cwd: "/example", busy: true, pending: false, waitingForApproval: false, status: "后台检查", lastResponse: "" };
+	const panel = new TerminalVoicePanel({ terminal: { rows: 48 }, requestRender() {} }, theme, controller, () => agent, () => {});
+	try {
+		for (let i = 0; i < 10; i++) {
+			panel.handleInput("\r"); await tick();
+			assert.equal(starts, i + 1);
+			panel.handleInput("\r"); await tick(); await tick();
+			assert.equal(controller.snapshot().voice, "stopped");
+			assert.doesNotMatch(panel.render(104).join("\n"), /正在处理/);
+		}
+		assert.equal(messages.some(event => event.type === "agent.cancel"), false);
+	} finally { panel.dispose(); await controller.dispose(); }
+});
+
+test("startup labels identify native preparation, microphone permission and model connection", () => {
+	const r = runtime();
+	try {
+		r.state.voice = "connecting";
+		for (const [phase, expected] of [["preparing-audio", /准备本地音频助手/], ["opening-microphone", /打开麦克风.*系统权限/], ["connecting-model", /连接 StepFun 语音模型/]]) {
+			r.state.startupPhase = phase; r.update();
+			assert.match(r.panel.render(104).join("\n"), expected);
+		}
+		assert.match(r.panel.render(104).join("\n"), /Step Code.*等待任务/);
 	} finally { r.panel.dispose(); }
 });

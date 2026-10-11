@@ -2,6 +2,6 @@
 	"id": "step-voice",
 	"name": "Step Voice",
 	"description": "Native terminal voice with StepFun models, connected to the current Step Code agent via /voice.",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"entry": "index.ts"
 }

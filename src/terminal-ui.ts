@@ -20,7 +20,12 @@ function clean(value: unknown): string {
 
 export function voiceStateLabel(state: TerminalVoiceSnapshot): string {
 	if (state.connection !== "connected") return state.connection === "connecting" ? "连接本地服务" : "服务未连接";
-	if (state.voice === "connecting") return "连接 StepFun 语音";
+	if (state.voice === "connecting") {
+		if (state.startupPhase === "preparing-audio") return "准备本地音频助手 · 首次启动可能需要编译";
+		if (state.startupPhase === "opening-microphone") return "打开麦克风 · 请确认系统权限提示";
+		return "连接 StepFun 语音模型";
+	}
+	if (state.startupPhase === "stopping") return "正在结束语音";
 	if (state.voice === "error") return "语音连接出错";
 	if (state.voice !== "ready") return "准备开始";
 	return state.muted ? "麦克风已静音" : state.speaking ? "正在回复 · 随时可打断" : "正在聆听";
@@ -185,7 +190,7 @@ export class TerminalVoicePanel implements Component {
 			for (const line of transcript.length ? transcript.slice(-transcriptRows) : ["说出想法，或按 T 输入文字。", "按 G 将任务交给当前 Step Code。"])
 				lines.push(row(` ${this.theme.fg("text", line)}`));
 			const agent = this.agentSnapshot();
-			lines.push(separator, heading(`Step Code  ·  ${agent.waitingForApproval ? "等待你确认" : agent.busy || agent.pending ? "后台工作中" : "准备就绪"}`));
+			lines.push(separator, heading(`Step Code  ·  ${agent.waitingForApproval ? "等待你确认" : agent.busy || agent.pending ? "后台工作中" : "等待任务"}`));
 			lines.push(row(` ${clean(agent.status)}`));
 			const lastText = clean(agent.lastResponse || this.snapshot.lastAgentText);
 			for (const line of wrapTextWithAnsi(lastText || "任务公开回复会显示在这里。", Math.max(1, inner - 2)).slice(-2)) lines.push(row(` ${this.theme.fg("dim", line)}`));

@@ -1,9 +1,11 @@
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import type { AgentSnapshot, VoiceDelivery } from "./types.ts";
 import { ResponseFence } from "./audio.mjs";
 export { ResponseFence as TerminalResponseFence } from "./audio.mjs";
 
 export type VoiceState = "stopped" | "connecting" | "ready" | "error";
+export type VoiceStartupPhase = "idle" | "preparing-audio" | "opening-microphone" | "connecting-model" | "ready" | "stopping" | "error";
 export interface TerminalVoiceConfig {
 	baseUrl: string;
 	realtimeModel: string;
@@ -27,6 +29,7 @@ export interface TerminalActivity {
 export interface TerminalVoiceSnapshot {
 	connection: "disconnected" | "connecting" | "connected";
 	voice: VoiceState;
+	startupPhase: VoiceStartupPhase;
 	muted: boolean;
 	micLevel: number;
 	speaking: boolean;
@@ -45,6 +48,7 @@ export interface NativeAudioCallbacks {
 	onError(error: unknown): void;
 	onClosed(): void;
 	onNotice?(message: string): void;
+	onStatus?(status: "preparing" | "permission" | "ready", message?: string): void;
 }
 export interface NativeAudioAdapter {
 	start(): Promise<void>;
@@ -67,9 +71,13 @@ export interface TerminalVoiceControllerOptions {
 	audioFactory?: (callbacks: NativeAudioCallbacks) => NativeAudioAdapter | Promise<NativeAudioAdapter>;
 	WebSocketImpl?: VoiceSocketConstructor;
 	connectTimeoutMs?: number;
+	audioStartTimeoutMs?: number;
+	modelReadyTimeoutMs?: number;
+	audioStopTimeoutMs?: number;
 }
 export interface NormalizedVoiceEvent {
 	type: string;
+	voiceSessionId?: string;
 	state?: VoiceState;
 	config?: Partial<TerminalVoiceConfig>;
 	agentConnected?: boolean;
@@ -96,6 +104,19 @@ const MAX_HISTORY = 100;
 const MAX_TEXT = 12_000;
 const DefaultWebSocket = createRequire(import.meta.url)("ws") as VoiceSocketConstructor;
 
+type StartupCancellation = "cancelled" | "timeout";
+interface StartupGate {
+	generation: number;
+	cancelled: Promise<StartupCancellation>;
+	cancel(reason?: StartupCancellation): void;
+	reason?: StartupCancellation;
+	timer?: ReturnType<typeof setTimeout>;
+}
+class StartupCancelledError extends Error {
+	reason: StartupCancellation;
+	constructor(reason: StartupCancellation) { super(reason); this.reason = reason; }
+}
+
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error || "未知错误");
 }
@@ -106,7 +127,9 @@ export class TerminalVoiceController {
 	private socket?: VoiceSocket;
 	private audio?: NativeAudioAdapter;
 	private audioGeneration = 0;
-	private audioStopping = false;
+	private voiceSessionId?: string;
+	private startup?: StartupGate;
+	private modelReadyTimer?: ReturnType<typeof setTimeout>;
 	private connectPromise?: Promise<void>;
 	private connectedResolve?: () => void;
 	private connectedReject?: (error: Error) => void;
@@ -117,7 +140,7 @@ export class TerminalVoiceController {
 	private outputKey?: string;
 	private fence = new ResponseFence();
 	private state: TerminalVoiceSnapshot = {
-		connection: "disconnected", voice: "stopped", muted: false, micLevel: 0, speaking: false,
+		connection: "disconnected", voice: "stopped", startupPhase: "idle", muted: false, micLevel: 0, speaking: false,
 		config: { baseUrl: "https://api.stepfun.com/v1", realtimeModel: "stepaudio-3-realtime-preview", ttsModel: "stepaudio-3-tts", voice: "linjiajiejie", keyConfigured: false },
 		agentConnected: false, transcripts: [], activity: [], lastAgentText: "",
 	};
@@ -164,9 +187,52 @@ export class TerminalVoiceController {
 	}
 	private clearPlayback(interrupted = false): void {
 		if (interrupted) this.fence.interrupt();
-		this.audio?.clear();
 		this.state.speaking = false;
 		for (const entry of this.state.transcripts) entry.final = true;
+		this.audio?.clear();
+	}
+	private createStartupGate(generation: number): StartupGate {
+		let resolveCancellation: (reason: StartupCancellation) => void = () => {};
+		const gate: StartupGate = {
+			generation,
+			cancelled: new Promise((resolve) => { resolveCancellation = resolve; }),
+			cancel(reason = "cancelled") {
+				if (gate.reason) return;
+				gate.reason = reason; clearTimeout(gate.timer); gate.timer = undefined;
+				resolveCancellation(reason);
+			},
+		};
+		gate.timer = setTimeout(() => gate.cancel("timeout"), this.options.audioStartTimeoutMs ?? 75_000);
+		this.startup = gate;
+		return gate;
+	}
+	private finishStartupGate(gate: StartupGate): void {
+		clearTimeout(gate.timer); gate.timer = undefined;
+		if (this.startup === gate) this.startup = undefined;
+	}
+	private async awaitStartup<T>(operation: Promise<T>, gate: StartupGate): Promise<T> {
+		const outcome = await Promise.race([
+			operation.then((value) => ({ value })),
+			gate.cancelled.then((reason) => ({ reason })),
+		]);
+		if ("reason" in outcome) throw new StartupCancelledError(outcome.reason);
+		return outcome.value;
+	}
+	private async stopAdapter(audio: NativeAudioAdapter): Promise<void> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.resolve().then(() => audio.stop()),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(() => reject(new Error("本机音频进程停止超时，请检查终端的麦克风状态。")), this.options.audioStopTimeoutMs ?? 2000);
+				}),
+			]);
+		} finally { clearTimeout(timer); }
+	}
+	private failAudioSession(generation: number, message: string): void {
+		if (generation !== this.audioGeneration || this.disposed) return;
+		this.notice(message, "error");
+		void this.stopWithState(true, "error");
 	}
 
 	connect(): Promise<void> {
@@ -222,16 +288,19 @@ export class TerminalVoiceController {
 			onLevel: (level) => { if (generation !== this.audioGeneration) return; this.state.micLevel = this.state.muted || this.state.voice !== "ready" ? 0 : Math.max(0, Math.min(1, level)); this.emit(); },
 			onPlayback: (playing) => { if (generation !== this.audioGeneration) return; this.state.speaking = playing && this.state.voice === "ready"; this.emit(); },
 			onError: (error) => {
-				if (generation !== this.audioGeneration || this.audioStopping || this.disposed) return;
-				this.notice(`本机音频出错：${errorText(error)}`, "error");
-				void this.stop().then(() => { this.state.voice = "error"; this.emit(); });
+				this.failAudioSession(generation, `本机音频出错：${errorText(error)}`);
 			},
 			onClosed: () => {
-				if (generation !== this.audioGeneration || this.audioStopping || this.disposed || this.state.voice === "stopped") return;
-				this.notice("本机音频进程已结束，请检查麦克风权限后重新开始。", "error");
-				void this.stop().then(() => { this.state.voice = "error"; this.emit(); });
+				if (this.state.voice === "stopped") return;
+				this.failAudioSession(generation, "本机音频进程已结束，请检查麦克风权限后重新开始。");
 			},
 			onNotice: (message) => { if (generation === this.audioGeneration && !this.disposed) this.notice(message); },
+			onStatus: (status, message) => {
+				if (generation !== this.audioGeneration || this.disposed || this.state.voice !== "connecting") return;
+				this.state.startupPhase = status === "preparing" ? "preparing-audio" : status === "permission" ? "opening-microphone" : "connecting-model";
+				if (message) this.state.notice = { kind: "info", text: message };
+				this.emit();
+			},
 		};
 		if (this.options.audioFactory) return this.options.audioFactory(callbacks);
 		const { NativeAudioEngine } = await import("./native-audio.mjs");
@@ -245,20 +314,45 @@ export class TerminalVoiceController {
 		if (this.state.voice === "ready" || this.state.voice === "connecting") return;
 		if (!this.state.config.keyConfigured) { this.notice(ENV_HELP, "warning"); return; }
 		const generation = ++this.audioGeneration;
-		this.state.voice = "connecting"; this.state.muted = false; this.state.notice = undefined;
+		const voiceSessionId = `${generation}-${randomUUID()}`;
+		this.voiceSessionId = voiceSessionId;
+		const gate = this.createStartupGate(generation);
+		this.state.voice = "connecting"; this.state.startupPhase = "preparing-audio"; this.state.muted = false; this.state.notice = undefined;
 		this.fence.reset(); this.outputKey = undefined; this.emit();
 		try {
-			const audio = await this.createAudio(generation);
-			if (generation !== this.audioGeneration || this.disposed) { await audio.stop(); return; }
+			const creatingAudio = this.createAudio(generation);
+			// A factory may resolve after cancellation. Dispose it without ever opening its microphone.
+			void creatingAudio.then((audio) => {
+				if (gate.reason || generation !== this.audioGeneration || this.disposed) void this.stopAdapter(audio).catch(() => {});
+			}, () => {});
+			const audio = await this.awaitStartup(creatingAudio, gate);
+			if (generation !== this.audioGeneration || this.disposed) { void this.stopAdapter(audio).catch(() => {}); return; }
 			this.audio = audio;
-			await audio.start();
-			if (generation !== this.audioGeneration || this.disposed) { await audio.stop(); return; }
-			this.send({ type: "voice.start" });
+			this.state.startupPhase = "opening-microphone"; this.emit();
+			await this.awaitStartup(Promise.resolve().then(() => {
+				if (gate.reason || generation !== this.audioGeneration || this.disposed) throw new StartupCancelledError(gate.reason || "cancelled");
+				return audio.start();
+			}), gate);
+			if (generation !== this.audioGeneration || this.disposed) return;
+			this.finishStartupGate(gate);
+			this.state.startupPhase = "connecting-model";
+			this.send({ type: "voice.start", voiceSessionId });
+			if (generation === this.audioGeneration && this.state.voice === "connecting") {
+				clearTimeout(this.modelReadyTimer);
+				this.modelReadyTimer = setTimeout(() => {
+					this.failAudioSession(generation, "StepFun 语音会话等待就绪超时。请检查 API Key、模型权限与网络，再重新开始。");
+				}, this.options.modelReadyTimeoutMs ?? 25_000);
+			}
+			this.emit();
 		} catch (error) {
 			if (generation !== this.audioGeneration || this.disposed) return;
-			this.notice(`语音启动失败：${errorText(error)}`, "error");
-			await this.stop(false); this.state.voice = "error"; this.emit();
-		}
+			if (error instanceof StartupCancelledError && error.reason === "cancelled") return;
+			const message = error instanceof StartupCancelledError
+				? "本机音频准备或麦克风启动超时。可以重新开始，或检查 macOS 麦克风权限与音频助手。"
+				: `语音启动失败：${errorText(error)}`;
+			this.notice(message, "error");
+			await this.stopWithState(false, "error");
+		} finally { this.finishStartupGate(gate); }
 	}
 
 	setMuted(value: boolean): void {
@@ -271,13 +365,35 @@ export class TerminalVoiceController {
 		if (this.state.voice !== "ready") return;
 		this.clearPlayback(true); this.send({ type: "voice.interrupt" }); this.emit();
 	}
-	async stop(notifyServer = true): Promise<void> {
-		++this.audioGeneration; this.state.voice = "stopped"; this.state.muted = false; this.state.micLevel = 0;
-		this.audioStopping = true; this.clearPlayback(); this.fence.reset();
-		if (notifyServer && this.socket?.readyState === 1 && !this.disposed) this.send({ type: "voice.stop" });
+	stop(notifyServer = true): Promise<void> { return this.stopWithState(notifyServer, "stopped"); }
+	private async stopWithState(notifyServer: boolean, finalState: "stopped" | "error"): Promise<void> {
+		const generation = ++this.audioGeneration;
+		// Retain the stopped identity for acknowledgements; a reentrant start may replace the field after emit().
+		const voiceSessionId = this.voiceSessionId;
+		this.startup?.cancel(); this.startup = undefined;
+		clearTimeout(this.modelReadyTimer); this.modelReadyTimer = undefined;
 		const audio = this.audio; this.audio = undefined;
-		try { await audio?.stop(); } catch (error) { if (!this.disposed) this.notice(`音频停止失败：${errorText(error)}`, "error"); }
-		finally { this.audioStopping = false; this.emit(); }
+		this.state.voice = finalState; this.state.startupPhase = finalState === "error" ? "error" : audio ? "stopping" : "idle";
+		this.state.muted = false; this.state.micLevel = 0; this.state.speaking = false;
+		for (const entry of this.state.transcripts) entry.final = true;
+		this.fence.reset(); this.emit();
+		const problems: string[] = [];
+		let cleanupFailed = false;
+		try { audio?.clear(); } catch (error) { problems.push(`清除播放队列失败：${errorText(error)}`); }
+		try {
+			if (notifyServer && this.socket?.readyState === 1 && !this.disposed) this.send({ type: "voice.stop", voiceSessionId });
+		} catch (error) { problems.push(`关闭上游语音失败：${errorText(error)}`); }
+		// Neither a playback IPC failure nor a socket failure may skip microphone cleanup.
+		try { if (audio) await this.stopAdapter(audio); }
+		catch (error) { cleanupFailed = true; problems.push(`音频停止失败：${errorText(error)}`); }
+		finally {
+			if (generation === this.audioGeneration && !this.disposed) {
+				if (cleanupFailed) this.state.voice = "error";
+				this.state.startupPhase = this.state.voice === "error" ? "error" : "idle";
+				if (problems.length) this.state.notice = { kind: cleanupFailed ? "error" : "warning", text: problems.join("；") };
+				this.emit();
+			}
+		}
 	}
 	private textValue(text: string): string {
 		const value = text.trim();
@@ -313,6 +429,8 @@ export class TerminalVoiceController {
 
 	private handleEvent(event: NormalizedEvent): void {
 		if (!event || typeof event.type !== "string" || this.disposed) return;
+		// A stopped provider may deliver frames after a rapid restart. Legacy unscoped frames remain compatible.
+		if (event.voiceSessionId !== undefined && event.voiceSessionId !== this.voiceSessionId) return;
 		switch (event.type) {
 			case "server.ready":
 				this.state.connection = "connected"; this.state.agentConnected = Boolean(event.agentConnected);
@@ -324,11 +442,11 @@ export class TerminalVoiceController {
 				break;
 			case "config.saved": this.applyPublicConfig(event.config); this.state.notice = { kind: "info", text: "已重新读取环境变量。点击开始语音即可连接。" }; break;
 			case "voice.state":
-				if (event.state && ["connecting", "ready", "stopped", "error"].includes(event.state)) this.state.voice = event.state;
-				if (event.state === "stopped" || event.state === "error") {
-					const terminalState = event.state;
-					void this.stop(false).then(() => { this.state.voice = terminalState; this.emit(); });
-				}
+				if (event.state === "ready" && this.audio && this.state.voice === "connecting") {
+					clearTimeout(this.modelReadyTimer); this.modelReadyTimer = undefined;
+					this.state.voice = "ready"; this.state.startupPhase = "ready";
+				} else if (event.state === "connecting" && this.audio && this.state.voice === "connecting") this.state.startupPhase = "connecting-model";
+				else if (event.state === "stopped" || event.state === "error") void this.stopWithState(false, event.state);
 				break;
 			case "speech.start": this.clearPlayback(true); break;
 			case "speech.end": this.state.micLevel = 0; break;
