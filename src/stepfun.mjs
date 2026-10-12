@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { CHANNELS, channelFromBaseUrl, isChannel, keyHint, loadSavedCredentials } from "./credentials.mjs";
 
 // Protocol sources, checked 2026-10-11:
 // https://platform.stepfun.com/docs/zh/api-reference/realtime/chat
@@ -74,19 +75,43 @@ function boundedInteger(value, fallback, min, max) {
 	return number;
 }
 
-/** Read explicit environment values only. Never discover or read credential files. */
-export function loadStepFunConfig(env = process.env) {
-	const baseUrl = String(env.STEP_VOICE_BASE_URL || "https://api.stepfun.com/v1").replace(/\/+$/, "");
+/** Official hosts with the open-platform (/v1) or Step Plan (/step_plan/v1) prefix. */
+export function assertOfficialBaseUrl(baseUrl) {
 	const url = new URL(baseUrl);
-	if (url.protocol !== "https:" || !["api.stepfun.com", "api.stepfun.ai"].includes(url.hostname)) {
-		throw new Error("STEP_VOICE_BASE_URL 必须使用官方 StepFun HTTPS API 地址。");
+	const path = url.pathname.replace(/\/+$/, "");
+	if (url.protocol !== "https:" || !["api.stepfun.com", "api.stepfun.ai"].includes(url.hostname) || url.username || url.password || url.port || url.search || url.hash || !["/v1", "/step_plan/v1"].includes(path)) {
+		throw new Error("服务地址须为官方 StepFun 地址：https://api.stepfun.com/v1（开放平台）或 https://api.stepfun.com/step_plan/v1（Step Plan）。");
 	}
+	return `${url.origin}${path}`;
+}
+
+/**
+ * Configuration from the panel setup (saved file) and environment variables.
+ * The saved setup is read from the real home, or from STEP_VOICE_HOME when a
+ * custom environment is passed (tests).
+ * Precedence: the Key and channel chosen in the panel, then STEP_API_KEY /
+ * STEPFUN_API_KEY, STEP_VOICE_CHANNEL and STEP_VOICE_BASE_URL. Model variables
+ * override the channel defaults.
+ */
+export function loadStepFunConfig(env = process.env, { saved = env === process.env || env.STEP_VOICE_HOME ? loadSavedCredentials(env) : undefined } = {}) {
+	const envKey = String(env.STEP_API_KEY || env.STEPFUN_API_KEY || "").trim();
+	const envBase = env.STEP_VOICE_BASE_URL ? assertOfficialBaseUrl(String(env.STEP_VOICE_BASE_URL)) : "";
+	const channel = saved?.channel
+		|| (isChannel(env.STEP_VOICE_CHANNEL) ? env.STEP_VOICE_CHANNEL : "")
+		|| (envBase ? channelFromBaseUrl(envBase) : "api");
+	const defaults = CHANNELS[channel];
+	const baseUrl = envBase && channelFromBaseUrl(envBase) === channel ? envBase : defaults.baseUrl;
+	const apiKey = saved?.apiKey || envKey;
 	return {
-		apiKey: String(env.STEP_API_KEY || env.STEPFUN_API_KEY || "").trim(),
+		apiKey,
+		channel,
+		keySource: saved?.apiKey ? "saved" : envKey ? "env" : "",
+		setupDone: Boolean(saved),
+		envKeyHint: keyHint(envKey),
 		baseUrl,
-		realtimeModel: modelId(env.STEP_VOICE_REALTIME_MODEL, "stepaudio-3-realtime-preview"),
-		ttsModel: modelId(env.STEP_VOICE_TTS_MODEL, "stepaudio-3-tts"),
-		asrModel: modelId(env.STEP_VOICE_ASR_MODEL, "stepaudio-3-asr-max"),
+		realtimeModel: modelId(env.STEP_VOICE_REALTIME_MODEL, defaults.realtimeModel),
+		ttsModel: modelId(env.STEP_VOICE_TTS_MODEL, defaults.ttsModel),
+		asrModel: modelId(env.STEP_VOICE_ASR_MODEL, defaults.asrModel),
 		voice: String(env.STEP_VOICE_VOICE || "linjiajiejie").trim(),
 		inputSampleRate: REALTIME_SAMPLE_RATE,
 		outputSampleRate: REALTIME_SAMPLE_RATE,
@@ -121,6 +146,32 @@ export function handshakeHint(status) {
 	if (status === 404) return "找不到实时语音模型（404）：请检查 STEP_VOICE_REALTIME_MODEL 和 STEP_VOICE_BASE_URL。";
 	if (status === 429) return "StepFun 请求过于频繁或额度用尽（429），请稍后重试。";
 	return `StepFun 实时语音握手失败（HTTP ${status}）。`;
+}
+
+/**
+ * Live check used by the first-run setup: the Key must be accepted by the
+ * channel and the channel's realtime model must open a session.
+ */
+export async function verifyChannelAccess(config, { WebSocketImpl, fetchImpl = globalThis.fetch, timeoutMs = 15_000 } = {}) {
+	const channel = CHANNELS[config.channel] || CHANNELS.api;
+	const planHint = config.channel === "step_plan" ? `请确认账号已订阅 Step Plan（${CHANNELS.step_plan.subscribeUrl}）。` : "请确认该 Key 有实时语音模型权限且账户余额充足。";
+	let response;
+	try {
+		response = await fetchImpl(`${config.baseUrl}/models`, { headers: { Authorization: `Bearer ${config.apiKey}` }, signal: AbortSignal.timeout(timeoutMs) });
+	} catch (error) {
+		return { ok: false, reason: "network", message: `无法连接 StepFun（${sanitizeProviderError(error, config.apiKey)}）。请检查网络或代理。` };
+	}
+	if (response.status === 401) return { ok: false, reason: "key", message: `${channel.label} 不认这个 Key（401）。请到 ${channel.keyUrl} 复制完整的 API Key 后重试。` };
+	if (!response.ok) return { ok: false, reason: "http", message: `${channel.label} 返回 HTTP ${response.status}。${planHint}` };
+	const client = new StepFunRealtimeClient({ ...config, turnDetection: null }, { WebSocketImpl, delegate: false });
+	try {
+		await client.connect({ timeoutMs });
+		return { ok: true };
+	} catch (error) {
+		return { ok: false, reason: "realtime", message: `Key 有效，但 ${channel.label} 上无法使用实时模型 ${config.realtimeModel}：${sanitizeProviderError(error, config.apiKey)} ${planHint}` };
+	} finally {
+		client.close();
+	}
 }
 
 export function sanitizeProviderError(value, apiKey = "") {

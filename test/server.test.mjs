@@ -309,3 +309,47 @@ test('spoken summaries remove code and cap input to the TTS limit', () => {
   assert.equal(speechSummary('# 结果\n```js\nsecret()\n```\n[文档](https://example.com)'), '结果\n代码已展示在任务面板。\n文档');
   assert.equal(speechSummary('a'.repeat(1200)).length, 850);
 });
+
+import { mkdtempSync as mkdtemp, statSync as statOf, readFileSync as readText, existsSync as exists } from 'node:fs';
+import { tmpdir as tmp } from 'node:os';
+import { join as joinPath } from 'node:path';
+
+test('credentials.save verifies the Key on the chosen channel before saving it privately', async (t) => {
+  const home = mkdtemp(joinPath(tmp(), 'step-voice-server-'));
+  const checked = [];
+  const verifyAccess = async (config) => { checked.push({ channel: config.channel, baseUrl: config.baseUrl, model: config.realtimeModel, key: config.apiKey }); return config.apiKey.startsWith('good') ? { ok: true } : { ok: false, reason: 'key', message: `不认这个 Key（401）：${config.apiKey}` }; };
+  const { client } = await fixture(t, { env: { STEP_VOICE_HOME: home }, verifyAccess });
+  const c = await client();
+  const ready = await c.wait((m) => m.type === 'server.ready');
+  assert.equal(ready.config.keyConfigured, false); assert.equal(ready.config.setupDone, false);
+
+  c.send({ type: 'credentials.save', channel: 'step_plan', apiKey: 'bad-key-000000000000' });
+  const invalid = await c.wait((m) => m.type === 'credentials.invalid');
+  assert.match(invalid.message, /401/);
+  assert.doesNotMatch(invalid.message, /bad-key-000000000000/, 'the Key is redacted from errors');
+  assert.equal(exists(joinPath(home, 'credentials.json')), false);
+
+  c.send({ type: 'credentials.save', channel: 'step_plan', apiKey: 'good-key-1111111111abcd' });
+  const saved = await c.wait((m) => m.type === 'credentials.saved');
+  assert.deepEqual(checked.at(-1), { channel: 'step_plan', baseUrl: 'https://api.stepfun.com/step_plan/v1', model: 'stepaudio-2.5-realtime', key: 'good-key-1111111111abcd' });
+  assert.equal(saved.config.channel, 'step_plan'); assert.equal(saved.config.keySource, 'saved'); assert.equal(saved.config.keyHint, '…abcd');
+  assert.equal(JSON.stringify(saved).includes('good-key-1111111111abcd'), false, 'the Key never goes back to the panel');
+  const file = joinPath(home, 'credentials.json');
+  assert.equal(statOf(file).mode & 0o777, 0o600);
+  assert.equal(JSON.parse(readText(file, 'utf8')).channel, 'step_plan');
+
+  c.send({ type: 'credentials.clear' });
+  const cleared = await c.wait((m) => m.type === 'credentials.saved' && m.cleared);
+  assert.equal(cleared.config.keyConfigured, false); assert.equal(exists(file), false);
+});
+
+test('credentials.save can keep the environment Key without writing it to disk', async (t) => {
+  const home = mkdtemp(joinPath(tmp(), 'step-voice-server-'));
+  const { client } = await fixture(t, { env: { STEP_VOICE_HOME: home, STEP_API_KEY: 'good-env-key-22222222' }, verifyAccess: async () => ({ ok: true }) });
+  const c = await client();
+  await c.wait((m) => m.type === 'server.ready');
+  c.send({ type: 'credentials.save', channel: 'api', apiKey: '', useEnvKey: true });
+  const saved = await c.wait((m) => m.type === 'credentials.saved');
+  assert.equal(saved.config.keySource, 'env'); assert.equal(saved.config.setupDone, true);
+  assert.equal(JSON.parse(readText(joinPath(home, 'credentials.json'), 'utf8')).apiKey, '');
+});

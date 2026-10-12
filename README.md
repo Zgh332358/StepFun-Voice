@@ -16,23 +16,31 @@ GitHub 托管插件源码和版本，不需要 npm 账号。插件仓库为 [Zgh
 
 ```bash
 step install -l git:github.com/Zgh332358/StepFun-Voice
-
-# 启动前在同一个终端设置 Key。
-export STEP_API_KEY='你的 StepFun API Key'
-
-# 可选：以下是默认模型和音色；按需替换右侧的值。
-export STEP_VOICE_REALTIME_MODEL='stepaudio-3-realtime-preview'
-export STEP_VOICE_TTS_MODEL='stepaudio-3-tts'
-export STEP_VOICE_VOICE='linjiajiejie'
-
 step
 ```
 
-然后输入 `/voice`，按 Enter 开始语音。Step Code 会 clone 仓库、安装运行依赖并注册扩展。安装仅注册插件，麦克风在用户明确开始语音后启用。
+然后输入 `/voice`。**第一次打开时面板会引导你完成接入**：
+
+1. 选择接入通道：**开放平台 API**（按调用量计费）或 **Step Plan**（使用订阅套餐额度）。
+2. 粘贴 API Key（输入时只显示最后 4 位）。两个通道用同一把平台 Key，在 [platform.stepfun.com/interface-key](https://platform.stepfun.com/interface-key) 创建；Step Plan 通道需要账号已[订阅套餐](https://platform.stepfun.com/step-plan)。
+3. 插件当场验证：先确认 Key 被该通道接受，再确认该通道的实时语音模型能建立会话。通过后保存，按 Enter 开始语音。
+
+如果启动前已经 `export STEP_API_KEY`，第 2 步直接按 Enter 就会使用它，不会另存一份。之后可在面板按 Ctrl+O → K 更换通道或 Key，或运行 `/voice setup`。Step Code 会 clone 仓库、安装运行依赖并注册扩展。安装仅注册插件，麦克风在用户明确开始语音后启用。
+
+### 两个接入通道
+
+| | 开放平台 API | Step Plan |
+| --- | --- | --- |
+| API 地址 | `https://api.stepfun.com/v1` | `https://api.stepfun.com/step_plan/v1` |
+| 实时语音模型 | `stepaudio-3-realtime-preview` | `stepaudio-2.5-realtime` |
+| 任务播报模型 | `stepaudio-3-tts` | `stepaudio-2.5-tts` |
+| 计费 | 按调用量 | 折算为 Step Plan 套餐额度 |
+
+2026-10-12 用同一把 Key 实测：Step Plan 路径不提供 `stepaudio-3-*` 模型（返回 404），所以选择通道时插件会同时切换默认模型。
 
 ### 默认模型与修改配置
 
-不设置模型和音色环境变量时，插件自动使用以下默认值：
+不设置模型和音色环境变量时，插件使用所选通道的默认值（下表为开放平台通道）：
 
 | 配置项 | 默认值 | 环境变量 |
 | --- | --- | --- |
@@ -40,7 +48,7 @@ step
 | 后台任务结果的语音播报 | `stepaudio-3-tts` | `STEP_VOICE_TTS_MODEL` |
 | 语音音色 | `linjiajiejie` | `STEP_VOICE_VOICE` |
 
-要修改配置，将上面安装示例中对应 `export` 右侧的值替换为你 StepFun 账号可用的模型或音色，再从**同一个终端**运行 `step`。如果 Step Code 已经运行，先退出，再设置变量并重新启动；在另一个终端执行 `export` 不会更新已有进程。启动后用 `/voice config`，或在语音面板按 Ctrl+O，查看当前配置。
+要覆盖默认模型或音色，用 `export STEP_VOICE_REALTIME_MODEL=...` 等变量设置你 StepFun 账号可用的模型或音色，再从**同一个终端**运行 `step`。如果 Step Code 已经运行，先退出，再设置变量并重新启动；在另一个终端执行 `export` 不会更新已有进程。启动后用 `/voice config`，或在语音面板按 Ctrl+O，查看当前配置。
 
 编码与文件、终端任务沿用 **Step Code 当前选择的模型**，不由这些语音变量指定。代码还提供默认型号为 `stepaudio-3-asr-max` 的独立 ASR helper，可通过 `STEP_VOICE_ASR_MODEL` 修改；当前通话的理解和字幕由 Realtime 完成，不使用这个独立 ASR 路径。
 
@@ -114,7 +122,8 @@ pnpm step
 | `/voice end` | 结束通话并关闭麦克风，保留本地语音服务 |
 | `/voice stop` | 释放语音控制器与本地服务 |
 | `/voice status` | 查看语音和宿主任务状态 |
-| `/voice config` | 显示环境变量接入说明 |
+| `/voice setup` | 打开接入引导：选择通道、输入并验证 API Key |
+| `/voice config` | 显示接入说明 |
 
 在语音面板中：
 
@@ -126,7 +135,7 @@ pnpm step
 | Ctrl+T | 切换麦克风静音 |
 | Ctrl+X | 打断当前回复 |
 | Ctrl+G | 请求停止后台 Agent 任务 |
-| Ctrl+O | 查看当前模型、音色和 Key 是否已配置 |
+| Ctrl+O | 接入设置：查看通道、Key 来源和模型；K 更换通道或 Key，X 清除保存的 Key |
 | Ctrl+Q | 结束通话并收起面板 |
 | Esc | 输入框有内容时清空；为空时收起面板，保留当前通话 |
 | Ctrl+C | 收起面板，保留当前通话；终端状态控件继续显示语音状态 |
@@ -137,9 +146,12 @@ pnpm step
 
 ## 环境变量与 StepFun 模型
 
-插件只读取启动进程的环境变量。支持 `STEP_API_KEY` 和 `STEPFUN_API_KEY`，同时存在时优先使用 `STEP_API_KEY`。Key 不写入文件，也不传给原生音频助手；终端设置只显示是否已配置。
+Key 有两个来源：
 
-**请在启动 Step Code 之前配置 Key。** 已经运行的进程不会收到另一个终端新设置的变量；设置完成后重新启动 Step Code。Step Plan / OAuth 登录与 StepFun 开放平台 Key 独立，已经登录编码工具不代表语音 API Key 已配置。
+- **面板引导里输入的 Key**：验证通过后保存在 `~/.stepcode/step-voice/credentials.json`。目录权限 700、文件权限 600，只有当前用户能读。文件里还记录所选通道。设置里按 X 可以删除。
+- **环境变量** `STEP_API_KEY` / `STEPFUN_API_KEY`（同时存在时优先 `STEP_API_KEY`）。已经运行的进程不会收到另一个终端新设置的变量，设置后需要重新启动 Step Code。
+
+两者都有时，使用面板里保存的 Key。Key 不传给原生音频助手，界面和报错里只显示最后 4 位。Step Code 的 Step Plan / OAuth 登录与 API Key 是两回事：已经登录编码工具，不代表语音 API Key 已配置。
 
 ```bash
 export STEP_API_KEY='你的 Key'
@@ -151,8 +163,9 @@ step
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `STEP_API_KEY` / `STEPFUN_API_KEY` | 无 | StepFun 开放平台鉴权 |
-| `STEP_VOICE_BASE_URL` | `https://api.stepfun.com/v1` | 官方 API 地址；也支持 `https://api.stepfun.ai/v1` |
+| `STEP_API_KEY` / `STEPFUN_API_KEY` | 无 | StepFun API Key（面板里保存的 Key 优先） |
+| `STEP_VOICE_CHANNEL` | `api` | 未在面板选择时的通道：`api` 或 `step_plan` |
+| `STEP_VOICE_BASE_URL` | 随通道 | 官方 API 地址：`/v1`（开放平台）或 `/step_plan/v1`（Step Plan），域名可为 `api.stepfun.com` / `api.stepfun.ai` |
 | `STEP_VOICE_REALTIME_MODEL` | `stepaudio-3-realtime-preview` | 连续语音理解、交流、字幕和工具调用 |
 | `STEP_VOICE_TTS_MODEL` | `stepaudio-3-tts` | 后台任务结果播报 |
 | `STEP_VOICE_VOICE` | `linjiajiejie` | 语音音色 |

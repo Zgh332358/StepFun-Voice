@@ -624,3 +624,33 @@ test("an incomplete reply we did not cancel still surfaces as incomplete", async
 	assert.equal(done.status, "incomplete");
 	assert.equal(done.statusDetails.reason, "max_output_tokens");
 });
+
+import { mkdtempSync, statSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { saveCredentials, loadSavedCredentials, credentialsFile } from "../src/credentials.mjs";
+
+test("channels: Step Plan uses its own base URL and 2.5 models; the panel Key wins over the environment", () => {
+	const home = mkdtempSync(join(tmpdir(), "step-voice-cred-"));
+	const env = { STEP_VOICE_HOME: home, STEP_API_KEY: "env-key-0000000000000000" };
+	let result = loadStepFunConfig(env);
+	assert.equal(result.channel, "api"); assert.equal(result.setupDone, false); assert.equal(result.keySource, "env");
+	assert.equal(result.envKeyHint, "…0000");
+	const file = saveCredentials({ channel: "step_plan", apiKey: "saved-key-1111111111111111" }, env);
+	assert.equal(statSync(file).mode & 0o777, 0o600);
+	assert.equal(statSync(home).mode & 0o777, 0o700);
+	result = loadStepFunConfig(env);
+	assert.equal(result.channel, "step_plan"); assert.equal(result.setupDone, true); assert.equal(result.keySource, "saved");
+	assert.equal(result.apiKey, "saved-key-1111111111111111");
+	assert.equal(result.baseUrl, "https://api.stepfun.com/step_plan/v1");
+	assert.equal(result.realtimeModel, "stepaudio-2.5-realtime");
+	assert.equal(result.ttsModel, "stepaudio-2.5-tts");
+	assert.equal(loadStepFunConfig({ ...env, STEP_VOICE_REALTIME_MODEL: "stepaudio-custom" }).realtimeModel, "stepaudio-custom");
+	// Choosing a channel without typing a Key keeps the environment Key and stores no secret.
+	saveCredentials({ channel: "api", apiKey: "" }, env);
+	assert.equal(JSON.parse(readFileSync(credentialsFile(env), "utf8")).apiKey, "");
+	result = loadStepFunConfig(env);
+	assert.equal(result.apiKey, "env-key-0000000000000000"); assert.equal(result.keySource, "env"); assert.equal(result.setupDone, true);
+	assert.equal(loadSavedCredentials({ STEP_VOICE_HOME: join(home, "missing") }), undefined);
+	assert.equal(loadStepFunConfig({ STEP_VOICE_BASE_URL: "https://api.stepfun.com/step_plan/v1" }).realtimeModel, "stepaudio-2.5-realtime");
+});

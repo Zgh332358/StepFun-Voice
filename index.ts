@@ -4,10 +4,9 @@ import { TerminalVoicePanel, voiceStateLabel, voiceWidgetLines } from "./src/ter
 import type { TerminalVoiceController, VoiceServerHandle } from "./src/types.ts";
 
 const CONFIG_HELP = [
-	"在启动 Step Code 的终端设置：",
-	"export STEP_API_KEY='你的 StepFun 开放平台 Key'",
-	"也支持 STEPFUN_API_KEY。设置后重新启动 Step Code，再运行 /voice。",
-	"不读取 .env 或登录凭据文件；Step Plan / OAuth 与平台 Key 独立。",
+	"运行 /voice setup，按引导选择接入通道（开放平台 API / Step Plan）并输入 API Key；Key 会先实时验证再保存。",
+	"API Key 在 https://platform.stepfun.com/interface-key 创建；Step Plan 通道需要账号已订阅套餐。",
+	"也可以在启动 Step Code 前 export STEP_API_KEY='你的 Key'（同样支持 STEPFUN_API_KEY）。",
 	"可选：STEP_VOICE_REALTIME_MODEL、STEP_VOICE_TTS_MODEL、STEP_VOICE_VOICE。",
 ].join("\n");
 
@@ -105,8 +104,8 @@ export default function stepVoice(pi: ExtensionAPI): void {
 	bridge.agent.subscribe(() => updateWidget());
 
 	pi.registerCommand("voice", {
-		description: "StepFun voice in the Step Code terminal (/voice start|mute|interrupt|end|stop|status|config)",
-		getArgumentCompletions: (prefix) => ["start", "mute", "interrupt", "end", "stop", "status", "config"]
+		description: "StepFun voice in the Step Code terminal (/voice setup|start|mute|interrupt|end|stop|status|config)",
+		getArgumentCompletions: (prefix) => ["setup", "start", "mute", "interrupt", "end", "stop", "status", "config"]
 			.filter((value) => value.startsWith(prefix.trim()))
 			.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
@@ -119,13 +118,13 @@ export default function stepVoice(pi: ExtensionAPI): void {
 				return;
 			}
 			if (action === "stop") { await close(); ctx.ui.notify("语音服务已关闭。", "info"); return; }
-			if (action && !["start", "mute", "interrupt", "end"].includes(action)) {
-				ctx.ui.notify("用法：/voice [start|mute|interrupt|end|stop|status|config]", "warning"); return;
+			if (action && !["setup", "start", "mute", "interrupt", "end"].includes(action)) {
+				ctx.ui.notify("用法：/voice [setup|start|mute|interrupt|end|stop|status|config]", "warning"); return;
 			}
 			try {
 				const voice = await ensureController(ctx);
 				if (action === "start") {
-					if (!voice.snapshot().config.keyConfigured) { ctx.ui.notify(CONFIG_HELP, "warning"); return; }
+					if (!voice.snapshot().config.keyConfigured) { ctx.ui.notify("还没有配置 API Key。运行 /voice 按引导完成设置。", "warning"); return; }
 					await voice.start(); updateWidget(); return;
 				}
 				if (action === "mute") { voice.mute(); updateWidget(); return; }
@@ -140,7 +139,7 @@ export default function stepVoice(pi: ExtensionAPI): void {
 				bridge.setVoicePanelOpen(true);
 				try {
 					await ctx.ui.custom<"hide" | "end">((tui, theme, _kb, done) => {
-						panel = new TerminalVoicePanel(tui, theme, voice, () => bridge.agent.snapshot(), done);
+						panel = new TerminalVoicePanel(tui, theme, voice, () => bridge.agent.snapshot(), done, { setup: action === "setup" });
 						return panel;
 					}, {
 						overlay: true,

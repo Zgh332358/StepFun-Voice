@@ -13,6 +13,23 @@ import type { AgentSnapshot, TerminalVoiceController, TerminalVoiceSnapshot, Voi
 
 type VoiceTheme = ExtensionCommandContext["ui"]["theme"];
 type PanelResult = "hide" | "end";
+type Channel = "api" | "step_plan";
+
+/** Mirrors src/credentials.mjs CHANNELS (kept here so the TUI module has no runtime import). */
+export const CHANNEL_INFO: Record<Channel, { label: string; billing: string; realtime: string; tts: string }> = {
+	api: { label: "开放平台 API", billing: "按调用量计费", realtime: "stepaudio-3-realtime-preview", tts: "stepaudio-3-tts" },
+	step_plan: { label: "Step Plan", billing: "使用订阅套餐额度", realtime: "stepaudio-2.5-realtime", tts: "stepaudio-2.5-tts" },
+};
+const CHANNEL_ORDER: Channel[] = ["api", "step_plan"];
+const KEY_URL = "https://platform.stepfun.com/interface-key";
+const PLAN_URL = "https://platform.stepfun.com/step-plan";
+
+/** Show only the last four characters of a Key that is being typed. */
+export function maskKey(value: string): string {
+	if (!value) return "";
+	const dots = "•".repeat(Math.min(Math.max(value.length - 4, 0), 40));
+	return value.length > 8 ? `${dots}${value.slice(-4)}` : "•".repeat(value.length);
+}
 
 function clean(value: unknown): string {
 	return stripTerminalSequences(String(value ?? "")).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
@@ -43,8 +60,12 @@ export function voiceWidgetLines(state: TerminalVoiceSnapshot, agent: AgentSnaps
 export class TerminalVoicePanel implements Component {
 	focused = false;
 	private readonly input = new Input({ prompt: "› " });
+	private readonly keyInput = new Input({ prompt: "" });
 	private snapshot: TerminalVoiceSnapshot;
 	private settings = false;
+	/** First-run / change-channel setup: choose the channel, then enter the Key */
+	private setup: "off" | "channel" | "key" | "done" = "off";
+	private channelIndex = 0;
 	private target: "voice" | VoiceDelivery = "voice";
 	private closed = false;
 	private released = false;
@@ -63,6 +84,7 @@ export class TerminalVoicePanel implements Component {
 		controller: TerminalVoiceController,
 		agentSnapshot: () => AgentSnapshot,
 		done: (result: PanelResult) => void,
+		options: { setup?: boolean } = {},
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -70,6 +92,8 @@ export class TerminalVoicePanel implements Component {
 		this.agentSnapshot = agentSnapshot;
 		this.done = done;
 		this.snapshot = controller.snapshot();
+		// First use: guide the user through choosing a channel and entering a Key.
+		if (options.setup || !this.snapshot.config.setupDone) this.openSetup();
 		this.unsubscribe = controller.subscribe((snapshot) => {
 			if (this.closed) return;
 			this.snapshot = snapshot;
@@ -125,8 +149,49 @@ export class TerminalVoicePanel implements Component {
 
 	private toggleVoice(): void {
 		if (this.snapshot.voice === "ready" || this.snapshot.voice === "connecting") this.run(() => this.controller.stop(), true);
-		else if (!this.snapshot.config.keyConfigured) this.settings = true;
+		else if (!this.snapshot.config.keyConfigured) this.openSetup();
 		else this.run(() => this.controller.start());
+	}
+
+	private openSetup(): void {
+		if (this.snapshot.voice === "ready" || this.snapshot.voice === "connecting") { this.error = "请先结束语音通话，再修改接入设置。"; return; }
+		this.settings = false;
+		this.setup = "channel";
+		this.channelIndex = Math.max(0, CHANNEL_ORDER.indexOf(this.snapshot.config.channel ?? "api"));
+		this.keyInput.setValue("");
+		this.error = "";
+	}
+
+	private submitKey(): void {
+		if (this.snapshot.setup?.phase === "checking") return;
+		const typed = this.keyInput.getValue().trim();
+		const useEnv = !typed && Boolean(this.snapshot.config.envKeyHint);
+		if (!typed && !useEnv) { this.error = "请粘贴 API Key 后按 Enter。"; return; }
+		const channel = CHANNEL_ORDER[this.channelIndex];
+		this.error = "";
+		this.run(async () => {
+			const result = await this.controller.saveCredentials(channel, typed, useEnv);
+			if (result.ok) { this.keyInput.setValue(""); this.setup = "done"; }
+		}, true);
+	}
+
+	private handleSetupInput(data: string): void {
+		if (this.setup === "channel") {
+			if (matchesKey(data, "up") || matchesKey(data, "down") || matchesKey(data, "tab")) this.channelIndex = (this.channelIndex + 1) % CHANNEL_ORDER.length;
+			else if (data === "1" || data === "2") this.channelIndex = Number(data) - 1;
+			else if (matchesKey(data, "return")) { this.setup = "key"; this.error = ""; }
+			else if (matchesKey(data, "escape")) { this.setup = "off"; this.error = ""; }
+		} else if (this.setup === "key") {
+			if (matchesKey(data, "return")) this.submitKey();
+			else if (matchesKey(data, "escape")) {
+				if (this.keyInput.getValue()) this.keyInput.setValue("");
+				else { this.setup = "channel"; }
+				this.error = "";
+			} else if (this.snapshot.setup?.phase !== "checking") { this.keyInput.handleInput(data); if (this.error) this.error = ""; }
+		} else if (this.setup === "done") {
+			if (matchesKey(data, "return")) { this.setup = "off"; this.toggleVoice(); }
+			else if (matchesKey(data, "escape")) this.setup = "off";
+		}
 	}
 
 	/**
@@ -137,8 +202,11 @@ export class TerminalVoicePanel implements Component {
 	handleInput(data: string): void {
 		if (this.closed) return;
 		if (matchesKey(data, "ctrl+c")) { this.close(); return; }
+		if (this.setup !== "off") { this.handleSetupInput(data); this.tui.requestRender(); return; }
 		if (this.settings) {
 			if (matchesKey(data, "escape") || matchesKey(data, "return") || matchesKey(data, "ctrl+o") || matchesKey(data, "s")) this.settings = false;
+			else if (matchesKey(data, "k")) this.openSetup();
+			else if (matchesKey(data, "x") && this.snapshot.config.keySource === "saved") this.run(() => this.controller.clearCredentials(), true);
 			else if (matchesKey(data, "ctrl+r") || matchesKey(data, "r")) this.run(() => this.controller.reloadConfigFromEnvironment());
 			this.tui.requestRender();
 			return;
@@ -175,21 +243,58 @@ export class TerminalVoicePanel implements Component {
 			this.theme.fg("borderMuted", `╭${"─".repeat(inner)}╮`),
 			heading("✦ Step Voice  /  语音工作搭档"),
 		];
-		if (this.settings) {
-			lines.push(separator, heading("在启动 Step Code 的终端接入 StepFun"));
-			for (const line of [
-				"export STEP_API_KEY='你的开放平台 Key'",
-				"也支持 STEPFUN_API_KEY；配置后重新启动 Step Code。",
-				"插件读取进程环境变量，不读取 .env 或 OAuth 登录文件。",
-				"Step Plan 登录和语音平台 Key 独立。",
-			]) for (const wrapped of wrapTextWithAnsi(line, Math.max(1, inner - 2))) lines.push(row(` ${this.theme.fg("dim", wrapped)}`));
-			lines.push(separator, row(` Key 状态   ${this.snapshot.config.keyConfigured ? this.theme.fg("success", "已配置") : this.theme.fg("warning", "尚未配置")}`));
+		const wrapDim = (text: string): void => { for (const wrapped of wrapTextWithAnsi(text, Math.max(1, inner - 2))) lines.push(row(` ${this.theme.fg("dim", wrapped)}`)); };
+		if (this.setup !== "off") {
+			const firstRun = !this.snapshot.config.setupDone;
+			const channel = CHANNEL_ORDER[this.channelIndex];
+			const phase = this.snapshot.setup?.phase ?? "idle";
+			if (this.setup === "channel") {
+				lines.push(separator, heading(firstRun ? "欢迎使用 · 第 1 步：选择接入通道" : "接入设置 · 第 1 步：选择接入通道"));
+				CHANNEL_ORDER.forEach((id, index) => {
+					const info = CHANNEL_INFO[id], on = index === this.channelIndex;
+					const mark = on ? this.theme.fg("accent", "› ●") : "  ○";
+					lines.push(row(` ${mark} ${index + 1}. ${on ? this.theme.bold(info.label) : info.label}${this.theme.fg("dim", `  ${info.billing} · 实时模型 ${info.realtime}`)}`));
+				});
+				lines.push(row(""));
+				wrapDim(`两个通道使用同一把平台 API Key，在 ${KEY_URL} 创建。`);
+				wrapDim(`选 Step Plan 需要账号已订阅套餐（${PLAN_URL}），语音消耗套餐额度；开放平台按实际调用扣费。`);
+				lines.push(separator, row(this.theme.fg("dim", " ↑↓ / 1 2 选择 · Enter 下一步 · Esc 稍后再说")));
+			} else if (this.setup === "key") {
+				const info = CHANNEL_INFO[channel];
+				lines.push(separator, heading(`第 2 步：输入 API Key（通道：${info.label}）`));
+				const typed = this.keyInput.getValue();
+				const shown = typed ? maskKey(typed) : this.theme.fg("dim", "粘贴 Key（输入内容会被遮住）");
+				lines.push(row(` ${this.theme.fg("accent", "›")} ${shown}`));
+				if (!typed && this.snapshot.config.envKeyHint) wrapDim(`检测到环境变量 STEP_API_KEY（${this.snapshot.config.envKeyHint}），直接按 Enter 就用它，不会另存一份。`);
+				wrapDim(`获取 Key：${KEY_URL}`);
+				wrapDim("Key 会先实时验证，通过后保存在 ~/.stepcode/step-voice/credentials.json，只有你的账户能读取。");
+				const status = this.error || (phase === "checking" || phase === "invalid" ? this.snapshot.setup!.message : "");
+				if (status) for (const line of wrapTextWithAnsi(clean(status), Math.max(1, inner - 2)).slice(0, 4))
+					lines.push(row(` ${this.theme.fg(phase === "checking" && !this.error ? "accent" : "error", line)}`));
+				lines.push(separator, row(this.theme.fg("dim", phase === "checking" ? " 正在验证…" : " Enter 验证并保存 · Esc 清空 / 返回上一步")));
+			} else {
+				const info = CHANNEL_INFO[this.snapshot.config.channel ?? channel];
+				lines.push(separator, heading("✓ 设置完成"));
+				lines.push(row(` 通道   ${info.label}（${info.billing}）`));
+				lines.push(row(` Key    ${this.snapshot.config.keySource === "env" ? `环境变量 ${this.snapshot.config.envKeyHint}` : `已保存 ${this.snapshot.config.keyHint ?? ""}`}`));
+				lines.push(row(` 模型   实时 ${clean(this.snapshot.config.realtimeModel)} · 播报 ${clean(this.snapshot.config.ttsModel)}`));
+				lines.push(separator, row(this.theme.fg("dim", " Enter 开始语音 · Esc 返回面板 · 以后可在 Ctrl+O 设置里更换")));
+			}
+		} else if (this.settings) {
+			const config = this.snapshot.config;
+			const info = CHANNEL_INFO[config.channel ?? "api"];
+			const source = !config.keyConfigured ? this.theme.fg("warning", "尚未配置")
+				: config.keySource === "saved" ? this.theme.fg("success", `面板保存 ${config.keyHint ?? ""}`)
+				: this.theme.fg("success", `环境变量 ${config.envKeyHint || config.keyHint || ""}`);
+			lines.push(separator, heading("接入设置"));
+			lines.push(row(` 通道      ${info.label}${this.theme.fg("dim", `  ${info.billing}`)}`));
+			lines.push(row(` API Key   ${source}`));
 			for (const [label, value] of [
-				["实时模型", this.snapshot.config.realtimeModel], ["任务播报", this.snapshot.config.ttsModel],
-				["音色", this.snapshot.config.voice], ["API", this.snapshot.config.baseUrl],
+				["实时模型", config.realtimeModel], ["任务播报", config.ttsModel],
+				["音色    ", config.voice], ["API     ", config.baseUrl],
 			]) lines.push(row(` ${label}  ${clean(value)}`));
-			lines.push(row(this.theme.fg("dim", " STEP_VOICE_REALTIME_MODEL / TTS_MODEL / VOICE 可自定义")));
-			lines.push(separator, row(this.theme.fg("dim", " Enter / Esc 返回  ·  R 重读进程环境  ·  Ctrl+C 收起")));
+			wrapDim("模型、音色也可用 STEP_VOICE_REALTIME_MODEL / STEP_VOICE_TTS_MODEL / STEP_VOICE_VOICE 覆盖。");
+			lines.push(separator, row(this.theme.fg("dim", ` K 更换通道或 Key${config.keySource === "saved" ? " · X 清除保存的 Key" : ""} · R 重读环境变量 · Enter / Esc 返回`)));
 		} else {
 			const stateColor = this.snapshot.voice === "ready" ? "success" : this.snapshot.voice === "error" ? "error" : "accent";
 			lines.push(row(` ${this.theme.fg(stateColor, "●")} ${this.theme.fg(stateColor, voiceStateLabel(this.snapshot))}${this.pending ? this.theme.fg("dim", "  ·  正在处理") : ""}`));

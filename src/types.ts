@@ -48,6 +48,11 @@ export interface TerminalVoiceConfig {
 	ttsModel: string;
 	voice: string;
 	keyConfigured: boolean;
+	channel?: "api" | "step_plan";
+	keySource?: "saved" | "env" | "";
+	setupDone?: boolean;
+	envKeyHint?: string;
+	keyHint?: string;
 }
 
 export interface TerminalVoiceSnapshot {
@@ -64,6 +69,7 @@ export interface TerminalVoiceSnapshot {
 	activity: { id: number; text: string; kind: string; time: number }[];
 	notice?: { kind: string; text: string };
 	lastAgentText: string;
+	setup?: { phase: "idle" | "checking" | "saved" | "invalid"; message: string };
 }
 
 /** Native microphone/playback and relay transport are owned by the controller. */
@@ -78,6 +84,8 @@ export interface TerminalVoiceController {
 	submitTask(text: string, delivery?: VoiceDelivery): void;
 	cancelTask(): void;
 	reloadConfigFromEnvironment(env?: NodeJS.ProcessEnv): void | Promise<void>;
+	saveCredentials(channel: "api" | "step_plan", apiKey: string, useEnvKey?: boolean): Promise<{ ok: boolean; message: string; file?: string }>;
+	clearCredentials(): void;
 	snapshot(): TerminalVoiceSnapshot;
 	subscribe(listener: (snapshot: TerminalVoiceSnapshot, event?: unknown) => void): () => void;
 	dispose(): Promise<void>;

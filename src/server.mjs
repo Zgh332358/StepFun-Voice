@@ -1,11 +1,12 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
-import { loadStepFunConfig, StepFunRealtimeClient, synthesizeSpeech } from './stepfun.mjs';
+import { assertOfficialBaseUrl, loadStepFunConfig, StepFunRealtimeClient, synthesizeSpeech, verifyChannelAccess } from './stepfun.mjs';
+import { CHANNELS, clearCredentials, credentialsFile, isChannel, keyHint, saveCredentials, validKeyShape } from './credentials.mjs';
 
 function publicConfig(config) {
-  const { baseUrl, realtimeModel, ttsModel, asrModel, voice } = config;
-  return { baseUrl, realtimeModel, ttsModel, asrModel, voice, keyConfigured: Boolean(config.apiKey) };
+  const { baseUrl, realtimeModel, ttsModel, asrModel, voice, channel, keySource, setupDone, envKeyHint } = config;
+  return { baseUrl, realtimeModel, ttsModel, asrModel, voice, channel: channel ?? 'api', keySource: keySource ?? (config.apiKey ? 'env' : ''), setupDone: Boolean(setupDone), envKeyHint: envKeyHint ?? '', keyHint: keyHint(config.apiKey), keyConfigured: Boolean(config.apiKey) };
 }
 
 function redact(text, config) {
@@ -47,10 +48,7 @@ function configUpdate(config, input) {
     }
     updated.apiKey = input.apiKey.trim();
   }
-  const url = new URL(updated.baseUrl);
-  if (url.protocol !== 'https:' || !['api.stepfun.com', 'api.stepfun.ai'].includes(url.hostname) || url.username || url.password || url.port || url.search || url.hash || url.pathname.replace(/\/$/, '') !== '/v1') {
-    throw new Error('服务地址须为 https://api.stepfun.com/v1 或 https://api.stepfun.ai/v1');
-  }
+  updated.baseUrl = assertOfficialBaseUrl(updated.baseUrl);
   return updated;
 }
 
@@ -82,6 +80,13 @@ export async function startVoiceServer(options = {}) {
   const agent = options.agent ?? unattachedAgent(cwd);
   const env = options.env ?? process.env;
   let config = configUpdate(loadStepFunConfig(env), {});
+  const verifyAccess = options.verifyAccess ?? ((value) => verifyChannelAccess(value, { WebSocketImpl: WebSocket }));
+  /** Apply a channel's defaults while keeping explicit model variables. */
+  function channelConfig(base, channel, apiKey) {
+    const defaults = CHANNELS[channel];
+    const pick = (name, field) => env[name]?.trim() || defaults[field];
+    return { ...base, channel, apiKey, baseUrl: defaults.baseUrl, realtimeModel: pick('STEP_VOICE_REALTIME_MODEL', 'realtimeModel'), ttsModel: pick('STEP_VOICE_TTS_MODEL', 'ttsModel'), asrModel: pick('STEP_VOICE_ASR_MODEL', 'asrModel') };
+  }
   let settings = { speakTasks: true };
   const capability = randomBytes(32).toString('base64url');
   let address;
@@ -305,6 +310,32 @@ export async function startVoiceServer(options = {}) {
           if (typeof message.settings?.speakTasks === 'boolean') settings.speakTasks = message.settings.speakTasks;
           send(client, { type: 'config.saved', config: publicConfig(config), settings });
           break;
+        case 'credentials.save': {
+          // First-run setup and later changes from the panel. The Key is checked live before saving.
+          if (active) throw new Error('请先结束语音通话再修改接入设置。');
+          if (!isChannel(message.channel)) throw new Error('接入通道无效');
+          const envKey = String(env.STEP_API_KEY || env.STEPFUN_API_KEY || '').trim();
+          const typed = typeof message.apiKey === 'string' ? message.apiKey.trim() : '';
+          const apiKey = typed || (message.useEnvKey ? envKey : '');
+          if (!apiKey) { send(client, { type: 'credentials.invalid', reason: 'empty', message: '请输入 API Key。' }); break; }
+          if (!validKeyShape(apiKey)) { send(client, { type: 'credentials.invalid', reason: 'shape', message: 'API Key 格式不对：应为一整串不含空格的字符，请重新复制。' }); break; }
+          const candidate = channelConfig(config, message.channel, apiKey);
+          send(client, { type: 'credentials.checking' });
+          const result = await verifyAccess(candidate);
+          if (!result?.ok) { send(client, { type: 'credentials.invalid', reason: result?.reason ?? 'unknown', message: redact(result?.message ?? '验证失败', candidate) }); break; }
+          // A Key that only came from the environment is not copied to disk.
+          const file = saveCredentials({ channel: message.channel, apiKey: typed ? apiKey : '' }, env);
+          config = { ...candidate, keySource: typed ? 'saved' : 'env', setupDone: true };
+          send(client, { type: 'credentials.saved', config: publicConfig(config), file });
+          break;
+        }
+        case 'credentials.clear': {
+          if (active) throw new Error('请先结束语音通话再修改接入设置。');
+          clearCredentials(env);
+          config = configUpdate(loadStepFunConfig(env, { saved: undefined }), {});
+          send(client, { type: 'credentials.saved', config: publicConfig(config), file: credentialsFile(env), cleared: true });
+          break;
+        }
         case 'input.text':
           if (!active?.ready || active.client !== client) throw new Error('请先开始语音通话，再发送对话文字。');
           clearSpeech(active);

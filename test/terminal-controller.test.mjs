@@ -62,7 +62,7 @@ test("local connection authenticates with token subprotocol and correct Origin w
 test("missing environment Key displays exact setup instruction and never starts native capture", async () => {
 	const r = runtime({ keyConfigured: false }); await r.ready(); await r.controller.start();
 	assert.equal(r.engines.length, 0);
-	assert.match(r.controller.snapshot().notice.text, /STEP_API_KEY.*STEPFUN_API_KEY.*重新启动/);
+	assert.match(r.controller.snapshot().notice.text, /API Key.*引导.*通道.*STEP_API_KEY/);
 	assert.equal(r.messages.some((message) => message.type === "voice.start"), false);
 	await r.controller.dispose();
 });

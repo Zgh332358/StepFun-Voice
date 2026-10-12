@@ -35,15 +35,15 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 const theme = { fg: (_color, text) => text, bold: (text) => text };
 const KEY = { ctrlT: "\x14", ctrlX: "\x18", ctrlG: "\x07", ctrlO: "\x0f", ctrlQ: "\x11", esc: "\x1b", tab: "\t", enter: "\r" };
 
-function runtime({ keyConfigured = true, start = async () => {} } = {}) {
+function runtime({ keyConfigured = true, setupDone = true, envKeyHint = "", start = async () => {}, save } = {}) {
 	const state = {
 		connection: "connected", voice: "stopped", muted: false, micLevel: 0, speaking: false,
-		config: { baseUrl: "https://api.stepfun.com/v1", realtimeModel: "stepaudio-3-realtime-preview", ttsModel: "stepaudio-3-tts", voice: "linjiajiejie", keyConfigured },
+		config: { baseUrl: "https://api.stepfun.com/v1", realtimeModel: "stepaudio-3-realtime-preview", ttsModel: "stepaudio-3-tts", voice: "linjiajiejie", keyConfigured, setupDone, envKeyHint, channel: "api", keySource: keyConfigured ? "env" : "", keyHint: "" },
 		agentConnected: true, transcripts: [], activity: [], lastAgentText: "",
 	};
 	const agent = { sessionId: "session", cwd: "/example", busy: false, pending: false, waitingForApproval: false, status: "等待任务", lastResponse: "" };
 	const listeners = new Set();
-	const calls = { start: 0, stop: 0, mute: 0, interrupt: 0, cancel: 0, unsubscribed: 0, text: [], tasks: [], done: [], renders: 0 };
+	const calls = { start: 0, stop: 0, mute: 0, interrupt: 0, cancel: 0, unsubscribed: 0, cleared: 0, text: [], tasks: [], done: [], saves: [], renders: 0 };
 	const update = () => { for (const listener of listeners) listener(state); };
 	const controller = {
 		snapshot: () => state,
@@ -56,20 +56,28 @@ function runtime({ keyConfigured = true, start = async () => {} } = {}) {
 		sendText(text) { calls.text.push(text); },
 		submitTask(text, delivery) { calls.tasks.push({ text, delivery }); },
 		reloadConfigFromEnvironment() {},
+		async saveCredentials(channel, apiKey, useEnvKey) {
+			calls.saves.push({ channel, apiKey, useEnvKey });
+			const result = save ? await save(channel, apiKey) : { ok: true, message: "ok" };
+			state.setup = { phase: result.ok ? "saved" : "invalid", message: result.message };
+			if (result.ok) Object.assign(state.config, { channel, setupDone: true, keyConfigured: true, keySource: apiKey ? "saved" : "env", keyHint: apiKey ? `…${apiKey.slice(-4)}` : "" });
+			update();
+			return result;
+		},
+		clearCredentials() { calls.cleared++; },
 	};
 	const panel = new TerminalVoicePanel({ terminal: { rows: 48 }, requestRender() { calls.renders++; } }, theme, controller, () => agent, (result) => calls.done.push(result));
+	state.setup = { phase: "idle", message: "" };
 	return { panel, state, agent, calls, update };
 }
 
-test("starting without a Key opens readable environment setup before invoking native capture", () => {
+test("starting without a Key opens the guided setup before invoking native capture", () => {
 	const r = runtime({ keyConfigured: false });
 	try {
 		r.panel.handleInput("\r");
 		const content = r.panel.render(104).join("\n");
-		assert.match(content, /export STEP_API_KEY=/);
-		assert.match(content, /STEPFUN_API_KEY.*重新启动/);
-		assert.match(content, /Step Plan.*独立/);
-		assert.match(content, /尚未配置/);
+		assert.match(content, /选择接入通道/);
+		assert.match(content, /开放平台 API/); assert.match(content, /Step Plan/);
 		assert.equal(r.calls.start, 0);
 	} finally { r.panel.dispose(); }
 });
@@ -155,7 +163,7 @@ test("real controller cancellation releases the panel for repeated starts while 
 		audioFactory: () => ({ start: () => { starts++; return new Promise(() => {}); }, stop: async () => {}, clear() {}, setMuted() {}, play() {} }),
 	});
 	const connected = controller.connect();
-	socket.emit("message", JSON.stringify({ type: "server.ready", config: { keyConfigured: true } }));
+	socket.emit("message", JSON.stringify({ type: "server.ready", config: { keyConfigured: true, setupDone: true } }));
 	await connected;
 	const agent = { sessionId: "session", cwd: "/example", busy: true, pending: false, waitingForApproval: false, status: "后台检查", lastResponse: "" };
 	const panel = new TerminalVoicePanel({ terminal: { rows: 48 }, requestRender() {} }, theme, controller, () => agent, () => {});
@@ -233,9 +241,70 @@ test("Ctrl+O opens settings and Enter returns to the conversation", () => {
 	const r = runtime();
 	try {
 		r.panel.handleInput(KEY.ctrlO);
-		assert.match(r.panel.render(104).join("\n"), /export STEP_API_KEY=/);
+		const view = r.panel.render(104).join("\n");
+		assert.match(view, /接入设置/); assert.match(view, /开放平台 API/); assert.match(view, /K 更换通道或 Key/);
 		r.panel.handleInput(KEY.enter);
 		assert.match(r.panel.render(104).join("\n"), /发给语音对话/);
 		assert.equal(r.calls.start, 0);
+	} finally { r.panel.dispose(); }
+});
+
+test("first use guides channel choice and Key entry, masks the Key, then starts voice", async () => {
+	const r = runtime({ keyConfigured: false, setupDone: false });
+	try {
+		assert.match(r.panel.render(104).join("\n"), /欢迎使用.*第 1 步/, "first open shows the wizard");
+		r.panel.handleInput("2");
+		assert.match(r.panel.render(104).join("\n"), /› ● 2\. Step Plan/);
+		r.panel.handleInput(KEY.enter);
+		assert.match(r.panel.render(104).join("\n"), /第 2 步.*Step Plan/);
+		const secret = "fake-test-key-0000000000000000000000wxyz";
+		r.panel.handleInput(`\x1b[200~${secret}\x1b[201~`); // bracketed paste
+		const masked = r.panel.render(104).join("\n");
+		assert.doesNotMatch(masked, /fake-test-key-0000/, "the Key is never shown in full");
+		assert.match(masked, /•+wxyz/);
+		r.panel.handleInput(KEY.enter); await tick(); await tick();
+		assert.deepEqual(r.calls.saves, [{ channel: "step_plan", apiKey: secret, useEnvKey: false }]);
+		const done = r.panel.render(104).join("\n");
+		assert.match(done, /设置完成/); assert.match(done, /Step Plan/); assert.doesNotMatch(done, /fake-test-key-0000/);
+		r.panel.handleInput(KEY.enter); await tick();
+		assert.equal(r.calls.start, 1, "Enter after setup starts the call");
+	} finally { r.panel.dispose(); }
+});
+
+test("a rejected Key keeps the wizard on the Key step with the reason", async () => {
+	const r = runtime({ keyConfigured: false, setupDone: false, save: async () => ({ ok: false, message: "开放平台 API 不认这个 Key（401）。" }) });
+	try {
+		r.panel.handleInput(KEY.enter);
+		r.panel.handleInput("bad-key-1234567890-abcd");
+		r.panel.handleInput(KEY.enter); await tick(); await tick();
+		const view = r.panel.render(104).join("\n");
+		assert.match(view, /第 2 步/); assert.match(view, /401/);
+		assert.equal(r.calls.start, 0);
+		r.panel.handleInput(KEY.esc); r.panel.handleInput(KEY.esc);
+		assert.match(r.panel.render(104).join("\n"), /第 1 步/, "Esc clears, then goes back a step");
+	} finally { r.panel.dispose(); }
+});
+
+test("an existing STEP_API_KEY can be used with one Enter and is not copied", async () => {
+	const r = runtime({ keyConfigured: true, setupDone: false, envKeyHint: "…etxQ" });
+	try {
+		r.panel.handleInput(KEY.enter);
+		assert.match(r.panel.render(104).join("\n"), /检测到环境变量 STEP_API_KEY（…etxQ）/);
+		r.panel.handleInput(KEY.enter); await tick(); await tick();
+		assert.deepEqual(r.calls.saves, [{ channel: "api", apiKey: "", useEnvKey: true }]);
+		assert.match(r.panel.render(104).join("\n"), /环境变量 …etxQ/);
+	} finally { r.panel.dispose(); }
+});
+
+test("settings can reopen the setup and clear a saved Key", async () => {
+	const r = runtime();
+	try {
+		r.state.config.keySource = "saved"; r.state.config.keyHint = "…abcd";
+		r.panel.handleInput(KEY.ctrlO);
+		assert.match(r.panel.render(104).join("\n"), /面板保存 …abcd/);
+		r.panel.handleInput("x"); await tick();
+		assert.equal(r.calls.cleared, 1);
+		r.panel.handleInput("k");
+		assert.match(r.panel.render(104).join("\n"), /接入设置 · 第 1 步/);
 	} finally { r.panel.dispose(); }
 });

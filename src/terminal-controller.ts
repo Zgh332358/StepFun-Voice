@@ -6,13 +6,24 @@ export { ResponseFence as TerminalResponseFence } from "./audio.mjs";
 
 export type VoiceState = "stopped" | "connecting" | "ready" | "error";
 export type VoiceStartupPhase = "idle" | "preparing-audio" | "opening-microphone" | "connecting-model" | "ready" | "stopping" | "error";
+export type VoiceChannel = "api" | "step_plan";
 export interface TerminalVoiceConfig {
 	baseUrl: string;
 	realtimeModel: string;
 	ttsModel: string;
 	voice: string;
 	keyConfigured: boolean;
+	channel: VoiceChannel;
+	/** Where the active Key comes from: the panel setup, the environment, or nowhere */
+	keySource: "saved" | "env" | "";
+	/** The first-run setup has been completed */
+	setupDone: boolean;
+	/** Last four characters of STEP_API_KEY / STEPFUN_API_KEY, if set */
+	envKeyHint: string;
+	/** Last four characters of the active Key */
+	keyHint: string;
 }
+export interface CredentialsResult { ok: boolean; message: string; file?: string }
 export interface TerminalTranscript {
 	id: string;
 	role: "user" | "assistant";
@@ -40,6 +51,8 @@ export interface TerminalVoiceSnapshot {
 	activity: TerminalActivity[];
 	notice?: { kind: "info" | "warning" | "error"; text: string };
 	lastAgentText: string;
+	/** Progress of a Key check started from the setup view */
+	setup: { phase: "idle" | "checking" | "saved" | "invalid"; message: string };
 }
 export interface NativeAudioCallbacks {
 	onAudio(audioBase64: string): void;
@@ -99,7 +112,7 @@ export interface NormalizedVoiceEvent {
 type NormalizedEvent = NormalizedVoiceEvent;
 type SnapshotListener = (snapshot: TerminalVoiceSnapshot, event?: NormalizedEvent) => void;
 
-const ENV_HELP = "请在启动 Step Code 的终端设置 STEP_API_KEY 或 STEPFUN_API_KEY，再重新启动 Step Code。例如：export STEP_API_KEY='你的Key'。插件只读取进程环境变量。";
+const ENV_HELP = "还没有配置 API Key。在语音面板按 Enter 按引导选择通道并输入 Key；也可以在启动 Step Code 前 export STEP_API_KEY。";
 const MAX_HISTORY = 100;
 const MAX_TEXT = 12_000;
 const DefaultWebSocket = createRequire(import.meta.url)("ws") as VoiceSocketConstructor;
@@ -139,16 +152,17 @@ export class TerminalVoiceController {
 	private sequence = 0;
 	private outputKey?: string;
 	private fence = new ResponseFence();
+	private credentialsWaiter?: (result: CredentialsResult) => void;
 	private state: TerminalVoiceSnapshot = {
 		connection: "disconnected", voice: "stopped", startupPhase: "idle", muted: false, micLevel: 0, speaking: false,
-		config: { baseUrl: "https://api.stepfun.com/v1", realtimeModel: "stepaudio-3-realtime-preview", ttsModel: "stepaudio-3-tts", voice: "linjiajiejie", keyConfigured: false },
-		agentConnected: false, transcripts: [], activity: [], lastAgentText: "",
+		config: { baseUrl: "https://api.stepfun.com/v1", realtimeModel: "stepaudio-3-realtime-preview", ttsModel: "stepaudio-3-tts", voice: "linjiajiejie", keyConfigured: false, channel: "api", keySource: "", setupDone: false, envKeyHint: "", keyHint: "" },
+		agentConnected: false, transcripts: [], activity: [], lastAgentText: "", setup: { phase: "idle", message: "" },
 	};
 
 	constructor(options: TerminalVoiceControllerOptions) { this.options = options; }
 
 	snapshot(): TerminalVoiceSnapshot {
-		return { ...this.state, config: { ...this.state.config }, agent: this.state.agent ? { ...this.state.agent } : undefined,
+		return { ...this.state, config: { ...this.state.config }, setup: { ...this.state.setup }, agent: this.state.agent ? { ...this.state.agent } : undefined,
 			transcripts: this.state.transcripts.map((entry) => ({ ...entry })), activity: this.state.activity.map((entry) => ({ ...entry })),
 			notice: this.state.notice ? { ...this.state.notice } : undefined };
 	}
@@ -416,6 +430,30 @@ export class TerminalVoiceController {
 		if (!this.state.agentConnected) throw new Error("后台编码任务未连接。");
 		this.send({ type: "agent.cancel" }); this.addActivity("正在请求停止后台任务"); this.emit();
 	}
+	/**
+	 * Check a Key against the chosen channel and save it (first-run setup).
+	 * Pass an empty key with useEnvKey to keep the Key from the environment.
+	 */
+	saveCredentials(channel: VoiceChannel, apiKey: string, useEnvKey = false): Promise<CredentialsResult> {
+		if (this.state.voice === "ready" || this.state.voice === "connecting") return Promise.reject(new Error("请先结束语音通话，再修改接入设置。"));
+		if (this.credentialsWaiter) return Promise.reject(new Error("正在验证上一个 Key，请稍候。"));
+		const key = apiKey.trim();
+		this.state.setup = { phase: "checking", message: "正在验证 Key 和通道…" }; this.emit();
+		return new Promise<CredentialsResult>((resolve, reject) => {
+			this.credentialsWaiter = resolve;
+			try { this.send({ type: "credentials.save", channel, apiKey: key, useEnvKey: useEnvKey && !key }); }
+			catch (error) { this.credentialsWaiter = undefined; this.state.setup = { phase: "invalid", message: errorText(error) }; this.emit(); reject(error); }
+		});
+	}
+	clearCredentials(): void {
+		if (this.state.voice === "ready" || this.state.voice === "connecting") throw new Error("请先结束语音通话，再修改接入设置。");
+		this.send({ type: "credentials.clear" });
+	}
+	private settleCredentials(result: CredentialsResult): void {
+		const resolve = this.credentialsWaiter; this.credentialsWaiter = undefined;
+		resolve?.(result);
+	}
+
 	reloadConfigFromEnvironment(env: Record<string, string | undefined> = process.env): void {
 		if (this.state.voice === "ready" || this.state.voice === "connecting") throw new Error("请先结束语音通话，再重新读取环境变量。");
 		const config: Record<string, string> = {};
@@ -440,6 +478,20 @@ export class TerminalVoiceController {
 				clearTimeout(this.connectTimer); this.connectTimer = undefined;
 				this.connectedResolve?.(); this.connectedResolve = undefined; this.connectedReject = undefined;
 				break;
+			case "credentials.checking": this.state.setup = { phase: "checking", message: "正在验证 Key 和通道…" }; break;
+			case "credentials.invalid":
+				this.state.setup = { phase: "invalid", message: event.message || "验证失败。" };
+				this.settleCredentials({ ok: false, message: this.state.setup.message });
+				break;
+			case "credentials.saved": {
+				this.applyPublicConfig(event.config);
+				const cleared = (event as { cleared?: boolean }).cleared;
+				const file = (event as { file?: string }).file;
+				this.state.setup = { phase: cleared ? "idle" : "saved", message: cleared ? "" : "验证通过，已保存。" };
+				this.state.notice = cleared ? { kind: "info", text: "已清除面板里保存的 Key。" } : undefined;
+				if (!cleared) this.settleCredentials({ ok: true, message: this.state.setup.message, file });
+				break;
+			}
 			case "config.saved": this.applyPublicConfig(event.config); this.state.notice = { kind: "info", text: "已重新读取环境变量。点击开始语音即可连接。" }; break;
 			case "voice.state":
 				if (event.state === "ready" && this.audio && this.state.voice === "connecting") {
@@ -480,7 +532,10 @@ export class TerminalVoiceController {
 			case "agent.tool": this.updateAgent(event); this.addActivity(`工具活动 · ${event.toolName || "工具"}`, event.isError ? "error" : "info"); break;
 			case "agent.complete": this.updateAgent(event); if (event.text) this.state.lastAgentText = event.text; this.addActivity(event.isError ? "后台任务未成功完成或已停止" : "后台任务已完成", event.isError ? "error" : "info"); break;
 			case "agent.error": this.updateAgent(event); this.addActivity(event.text || "后台任务执行出错", "error"); break;
-			case "error": this.state.notice = { kind: "error", text: event.message || "语音服务发生错误。" }; break;
+			case "error":
+				this.state.notice = { kind: "error", text: event.message || "语音服务发生错误。" };
+				if (this.credentialsWaiter) { this.state.setup = { phase: "invalid", message: this.state.notice.text }; this.settleCredentials({ ok: false, message: this.state.notice.text }); }
+				break;
 			case "closed": void this.stop(false); this.state.notice = { kind: "info", text: "语音会话已结束，可以重新开始。" }; break;
 		}
 		this.emit(event);
@@ -488,8 +543,10 @@ export class TerminalVoiceController {
 	private applyPublicConfig(config: unknown): void {
 		if (!config || typeof config !== "object") return;
 		const value = config as Record<string, unknown>;
-		for (const field of ["baseUrl", "realtimeModel", "ttsModel", "voice"] as const) if (typeof value[field] === "string") this.state.config[field] = value[field];
-		if (typeof value.keyConfigured === "boolean") this.state.config.keyConfigured = value.keyConfigured;
+		for (const field of ["baseUrl", "realtimeModel", "ttsModel", "voice", "envKeyHint", "keyHint"] as const) if (typeof value[field] === "string") this.state.config[field] = value[field];
+		if (value.channel === "api" || value.channel === "step_plan") this.state.config.channel = value.channel;
+		if (value.keySource === "saved" || value.keySource === "env" || value.keySource === "") this.state.config.keySource = value.keySource;
+		for (const field of ["keyConfigured", "setupDone"] as const) if (typeof value[field] === "boolean") this.state.config[field] = value[field];
 	}
 	private updateAgent(event: NormalizedEvent): void {
 		if (!event.snapshot) return;
@@ -501,6 +558,7 @@ export class TerminalVoiceController {
 		await this.stop(); this.disposed = true;
 		clearTimeout(this.connectTimer); this.connectTimer = undefined;
 		this.connectedReject?.(new Error("语音控制器已关闭。")); this.connectedReject = undefined; this.connectedResolve = undefined;
+		this.settleCredentials({ ok: false, message: "语音控制器已关闭。" });
 		this.socket?.close(); this.socket = undefined;
 		this.state.connection = "disconnected"; this.state.agentConnected = false; this.emit(); this.listeners.clear();
 	}
