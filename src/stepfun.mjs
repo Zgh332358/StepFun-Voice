@@ -422,6 +422,13 @@ export class StepFunRealtimeClient {
 			this.muteOutput = false;
 		}
 		if (event.type === "response.done" && (!event.responseId || event.responseId === this.activeResponseId)) this.responseActive = false;
+		// StepFun answers our own response.cancel (barge-in, Ctrl+X, typed text) with status
+		// "incomplete" and no details. That is a normal interruption, not a failed reply.
+		if (event.type === "response.done" && event.status === "incomplete" && !event.statusDetails
+			&& (this.cancelledResponseIds.has(event.responseId) || (this.hasCancelledResponse && !event.responseId))) {
+			event.status = "cancelled";
+			event.statusDetails = { reason: "client_cancelled" };
+		}
 		if (event.type === "speech.start" && this.autoBargeIn) this.cancelResponse();
 		const fenced = this.muteOutput || this.cancelledResponseIds.has(event.responseId) || (this.hasCancelledResponse && !event.responseId);
 		if (event.type.startsWith("output.") && fenced) return;

@@ -603,3 +603,24 @@ test("under Node a 401 handshake explains that the Key is invalid", async () => 
 	await assert.rejects(promise, /401.*开放平台 Key/);
 	assert.match(events.find((event) => event.type === "error").message, /API Key（401）/);
 });
+
+test("a reply cut off by our own barge-in cancel is reported as cancelled, not incomplete", async () => {
+	const { events, socket } = await connected();
+	socket.receive({ type: "response.created", response: { id: "r1", status: "in_progress" } });
+	socket.receive({ type: "input_audio_buffer.speech_started", item_id: "i2" });
+	assert.equal(socket.sent.at(-1).type, "response.cancel");
+	// Real StepFun behaviour (verified live): the cancelled reply ends as "incomplete" without status_details.
+	socket.receive({ type: "response.done", response: { id: "r1", status: "incomplete" } });
+	const done = events.filter((event) => event.type === "response.done").at(-1);
+	assert.equal(done.status, "cancelled");
+	assert.equal(done.statusDetails.reason, "client_cancelled");
+});
+
+test("an incomplete reply we did not cancel still surfaces as incomplete", async () => {
+	const { events, socket } = await connected();
+	socket.receive({ type: "response.created", response: { id: "r9", status: "in_progress" } });
+	socket.receive({ type: "response.done", response: { id: "r9", status: "incomplete", status_details: { reason: "max_output_tokens" } } });
+	const done = events.filter((event) => event.type === "response.done").at(-1);
+	assert.equal(done.status, "incomplete");
+	assert.equal(done.statusDetails.reason, "max_output_tokens");
+});
