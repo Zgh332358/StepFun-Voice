@@ -114,8 +114,22 @@ export function createRealtimeSession(config, { delegate = true } = {}) {
 }
 
 /** Redact both the configured key and generic bearer credentials before UI output. */
+/** Turns a rejected WebSocket handshake into an actionable message. */
+export function handshakeHint(status) {
+	if (status === 401) return "StepFun 拒绝了 API Key（401）：Key 无效或不是开放平台 Key。请在 https://platform.stepfun.com 创建 Key，设置 STEP_API_KEY 后重启 Step Code。";
+	if (status === 403) return "StepFun 拒绝访问（403）：当前 Key 没有实时语音模型权限或额度不足。";
+	if (status === 404) return "找不到实时语音模型（404）：请检查 STEP_VOICE_REALTIME_MODEL 和 STEP_VOICE_BASE_URL。";
+	if (status === 429) return "StepFun 请求过于频繁或额度用尽（429），请稍后重试。";
+	return `StepFun 实时语音握手失败（HTTP ${status}）。`;
+}
+
 export function sanitizeProviderError(value, apiKey = "") {
-	let message = String(value instanceof Error ? value.message : value || "StepFun 语音服务出错。");
+	// Bun's ws shim emits ErrorEvent objects (not Error) whose text is in .message / .error.
+	const raw = value instanceof Error ? value.message
+		: value && typeof value === "object" ? (value.message || value.error?.message || value.reason || "")
+		: value;
+	let message = String(raw || "StepFun 语音服务出错。");
+	if (/Expected 101 status code/i.test(message)) message = "StepFun 拒绝了实时语音连接（握手未返回 101）。最常见原因是 API Key 无效或不是开放平台 Key，其次是没有该实时模型的权限。请检查 STEP_API_KEY 后重启 Step Code。";
 	if (apiKey) message = message.split(apiKey).join("[redacted]");
 	return message.replace(/Bearer\s+[^\s"',;]+/gi, "Bearer [redacted]").slice(0, 1_000);
 }
@@ -286,6 +300,14 @@ export class StepFunRealtimeClient {
 					this.close();
 				}
 				this.handleEvent(raw);
+			});
+			// Node's ws reports the HTTP status of a rejected handshake (Bun does not emit this event).
+			this.socket.on("unexpected-response", (_request, response) => {
+				const message = handshakeHint(response?.statusCode);
+				response?.resume?.();
+				this.onEvent({ type: "error", code: "connection_error", message });
+				finish(new Error(message));
+				this.close();
 			});
 			this.socket.on("error", (error) => {
 				const message = sanitizeProviderError(error, this.config.apiKey);

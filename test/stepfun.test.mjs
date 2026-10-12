@@ -6,6 +6,7 @@ import {
 	loadStepFunConfig,
 	normalizeRealtimeEvent,
 	readSseEvents,
+	sanitizeProviderError,
 	StepFunRealtimeClient,
 	synthesizeSpeech,
 	transcribeAudio,
@@ -578,4 +579,27 @@ test("ASR HTTP and SSE failures redact keys and missing final transcripts fail v
 		transcribeAudio(config(), Buffer.from([0, 0]), { fetchImpl: async () => sseResponse([{ type: "transcript.text.delta", delta: "partial" }]) }),
 		/完整转录前关闭/,
 	);
+});
+
+test("a rejected handshake under Bun (ErrorEvent) is reported in words, not [object ErrorEvent]", async () => {
+	const events = [];
+	const client = new StepFunRealtimeClient(config(), { WebSocketImpl: FakeWebSocket, onEvent: (event) => events.push(event) });
+	const promise = client.connect();
+	// Shape of Bun's ws shim error: not an Error, text lives in .message
+	const bunError = { type: "error", message: "WebSocket connection to 'wss://api.stepfun.com/v1/realtime' failed: Expected 101 status code", toString: () => "[object ErrorEvent]" };
+	client.socket.emit("error", bunError);
+	await assert.rejects(promise, /拒绝了实时语音连接.*API Key/);
+	const error = events.find((event) => event.type === "error");
+	assert.doesNotMatch(error.message, /object ErrorEvent/);
+	assert.match(error.message, /STEP_API_KEY/);
+	assert.equal(sanitizeProviderError({ error: new Error("boom Bearer abc.def") }), "boom Bearer [redacted]");
+});
+
+test("under Node a 401 handshake explains that the Key is invalid", async () => {
+	const events = [];
+	const client = new StepFunRealtimeClient(config(), { WebSocketImpl: FakeWebSocket, onEvent: (event) => events.push(event) });
+	const promise = client.connect();
+	client.socket.emit("unexpected-response", {}, { statusCode: 401, resume() {} });
+	await assert.rejects(promise, /401.*开放平台 Key/);
+	assert.match(events.find((event) => event.type === "error").message, /API Key（401）/);
 });
