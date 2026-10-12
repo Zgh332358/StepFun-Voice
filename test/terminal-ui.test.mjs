@@ -33,6 +33,7 @@ try {
 const { visibleWidth } = await import("@step-harness/pi-tui");
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const theme = { fg: (_color, text) => text, bold: (text) => text };
+const KEY = { ctrlT: "\x14", ctrlX: "\x18", ctrlG: "\x07", ctrlO: "\x0f", ctrlQ: "\x11", esc: "\x1b", tab: "\t", enter: "\r" };
 
 function runtime({ keyConfigured = true, start = async () => {} } = {}) {
 	const state = {
@@ -79,15 +80,15 @@ test("microphone startup remains cancellable while native permission or compilat
 	try {
 		r.panel.handleInput("\r"); await tick();
 		assert.equal(r.state.voice, "connecting");
-		for (const key of ["m", "i", "c", "\r"]) r.panel.handleInput(key);
+		for (const key of [KEY.ctrlT, KEY.ctrlX, KEY.ctrlG, KEY.enter]) r.panel.handleInput(key);
 		await tick();
 		assert.equal(r.calls.stop, 1);
 		assert.equal(r.calls.mute, 1); assert.equal(r.calls.interrupt, 1); assert.equal(r.calls.cancel, 1);
 		assert.equal(r.state.voice, "stopped");
 		resume(); await tick();
-		// A new pending startup also allows Q to end and dismiss immediately.
+		// A new pending startup also allows Ctrl+Q to end and dismiss immediately.
 		r.panel.handleInput("\r"); await tick();
-		r.panel.handleInput("q"); await tick();
+		r.panel.handleInput(KEY.ctrlQ); await tick();
 		assert.equal(r.calls.stop, 2); assert.deepEqual(r.calls.done, ["end"]);
 		resume(); await tick();
 	} finally { resume?.(); r.panel.dispose(); }
@@ -132,7 +133,7 @@ test("the microphone meter uses captured input level rather than assistant playb
 test("typed tasks preserve an explicit follow-up delivery choice through the native panel", async () => {
 	const r = runtime();
 	try {
-		r.panel.handleInput("g"); r.panel.handleInput("\t");
+		r.panel.handleInput(KEY.tab); r.panel.handleInput(KEY.tab);
 		r.panel.handleInput("检查语音插件"); r.panel.handleInput("\r"); await tick();
 		assert.deepEqual(r.calls.tasks, [{ text: "检查语音插件", delivery: "followUp" }]);
 		assert.deepEqual(r.calls.text, []);
@@ -179,5 +180,62 @@ test("startup labels identify native preparation, microphone permission and mode
 			assert.match(r.panel.render(104).join("\n"), expected);
 		}
 		assert.match(r.panel.render(104).join("\n"), /Step Code.*等待任务/);
+	} finally { r.panel.dispose(); }
+});
+
+test("typing goes straight into the text box while the microphone is listening", async () => {
+	const r = runtime();
+	try {
+		r.state.voice = "ready"; r.update();
+		// Letters that used to be single-key shortcuts (m/i/t/g/s/c/q) are now plain text.
+		for (const ch of ["m", "i", "c", "q", "s", " ", "你好"]) r.panel.handleInput(ch);
+		assert.equal(r.calls.mute, 0); assert.equal(r.calls.interrupt, 0); assert.equal(r.calls.cancel, 0); assert.equal(r.calls.stop, 0);
+		assert.match(r.panel.render(104).join("\n"), /micqs 你好/);
+		r.panel.handleInput(KEY.enter); await tick();
+		assert.deepEqual(r.calls.text, ["micqs 你好"]);
+		assert.equal(r.state.voice, "ready", "sending text must not end the call");
+		assert.doesNotMatch(r.panel.render(104).join("\n"), /micqs 你好/);
+	} finally { r.panel.dispose(); }
+});
+
+test("Enter on an empty box starts and ends the call; Ctrl shortcuts control it during typing", async () => {
+	const r = runtime();
+	try {
+		r.panel.handleInput(KEY.enter); await tick();
+		assert.equal(r.calls.start, 1);
+		r.state.voice = "ready"; r.update();
+		r.panel.handleInput("草稿");
+		r.panel.handleInput(KEY.ctrlT); r.panel.handleInput(KEY.ctrlX); await tick();
+		assert.equal(r.calls.mute, 1); assert.equal(r.calls.interrupt, 1);
+		assert.match(r.panel.render(104).join("\n"), /草稿/, "shortcuts keep the draft");
+		r.panel.handleInput(KEY.esc);
+		assert.deepEqual(r.calls.done, [], "the first Escape only clears the draft");
+		r.panel.handleInput(KEY.enter); await tick();
+		assert.equal(r.calls.stop, 1);
+		r.panel.handleInput(KEY.esc);
+		assert.deepEqual(r.calls.done, ["hide"]);
+	} finally { r.panel.dispose(); }
+});
+
+test("text for the voice conversation is kept with a hint when the call has not started", async () => {
+	const r = runtime();
+	try {
+		r.panel.handleInput("先记下这句"); r.panel.handleInput(KEY.enter); await tick();
+		assert.deepEqual(r.calls.text, []); assert.equal(r.calls.start, 0);
+		const view = r.panel.render(104).join("\n");
+		assert.match(view, /先记下这句/); assert.match(view, /语音还没开始/);
+		r.panel.handleInput(KEY.tab); r.panel.handleInput(KEY.enter); await tick();
+		assert.deepEqual(r.calls.tasks, [{ text: "先记下这句", delivery: "steer" }]);
+	} finally { r.panel.dispose(); }
+});
+
+test("Ctrl+O opens settings and Enter returns to the conversation", () => {
+	const r = runtime();
+	try {
+		r.panel.handleInput(KEY.ctrlO);
+		assert.match(r.panel.render(104).join("\n"), /export STEP_API_KEY=/);
+		r.panel.handleInput(KEY.enter);
+		assert.match(r.panel.render(104).join("\n"), /发给语音对话/);
+		assert.equal(r.calls.start, 0);
 	} finally { r.panel.dispose(); }
 });

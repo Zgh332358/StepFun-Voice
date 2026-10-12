@@ -44,7 +44,6 @@ export class TerminalVoicePanel implements Component {
 	focused = false;
 	private readonly input = new Input({ prompt: "› " });
 	private snapshot: TerminalVoiceSnapshot;
-	private editing = false;
 	private settings = false;
 	private target: "voice" | VoiceDelivery = "voice";
 	private closed = false;
@@ -76,8 +75,6 @@ export class TerminalVoicePanel implements Component {
 			this.snapshot = snapshot;
 			this.tui.requestRender();
 		});
-		this.input.onSubmit = (text) => this.submitText(text);
-		this.input.onEscape = () => { this.editing = false; this.input.setValue(""); this.tui.requestRender(); };
 	}
 
 	invalidate(): void {}
@@ -112,39 +109,60 @@ export class TerminalVoicePanel implements Component {
 		const text = raw.trim();
 		if (!text) return;
 		if (text.length > 12_000) { this.error = "内容过长，请拆成几段。"; return; }
+		if (this.target === "voice" && this.snapshot.voice !== "ready") {
+			// Keep the draft: the user can start the call or switch the target with Tab.
+			this.error = this.snapshot.voice === "connecting"
+				? "语音还在连接，稍后再发送；也可以按 Tab 把文字交给 Step Code。"
+				: "语音还没开始：清空输入后按 Enter 开始通话，或按 Tab 把文字交给 Step Code。";
+			return;
+		}
 		this.run(() => {
 			if (this.target === "voice") this.controller.sendText(text);
 			else this.controller.submitTask(text, this.target);
 			this.input.setValue("");
-			this.editing = false;
 		});
 	}
 
+	private toggleVoice(): void {
+		if (this.snapshot.voice === "ready" || this.snapshot.voice === "connecting") this.run(() => this.controller.stop(), true);
+		else if (!this.snapshot.config.keyConfigured) this.settings = true;
+		else this.run(() => this.controller.start());
+	}
+
+	/**
+	 * The text box is always live, so typing works while the microphone is open.
+	 * Panel actions therefore use Ctrl shortcuts that the host Input does not bind;
+	 * plain letters (and IME-composed Chinese) always go into the text box.
+	 */
 	handleInput(data: string): void {
 		if (this.closed) return;
-		if (this.editing) {
-			if (matchesKey(data, "tab")) {
-				const targets = ["voice", "steer", "followUp"] as const;
-				this.target = targets[(targets.indexOf(this.target) + 1) % targets.length];
-			} else this.input.handleInput(data);
+		if (matchesKey(data, "ctrl+c")) { this.close(); return; }
+		if (this.settings) {
+			if (matchesKey(data, "escape") || matchesKey(data, "return") || matchesKey(data, "ctrl+o") || matchesKey(data, "s")) this.settings = false;
+			else if (matchesKey(data, "ctrl+r") || matchesKey(data, "r")) this.run(() => this.controller.reloadConfigFromEnvironment());
 			this.tui.requestRender();
 			return;
 		}
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) { this.close(); return; }
-		if (this.settings) {
-			if (matchesKey(data, "s") || matchesKey(data, "return")) this.settings = false;
-			if (matchesKey(data, "r")) this.run(() => this.controller.reloadConfigFromEnvironment());
-		} else if (matchesKey(data, "return") || matchesKey(data, "space")) {
-			if (this.snapshot.voice === "ready" || this.snapshot.voice === "connecting") this.run(() => this.controller.stop(), true);
-			else if (!this.snapshot.config.keyConfigured) this.settings = true;
-			else this.run(() => this.controller.start());
-		} else if (matchesKey(data, "m")) this.run(() => this.controller.mute(), true);
-		else if (matchesKey(data, "i")) this.run(() => this.controller.interrupt(), true);
-		else if (matchesKey(data, "s")) this.settings = true;
-		else if (matchesKey(data, "t")) this.editing = true;
-		else if (matchesKey(data, "g")) { this.target = "steer"; this.editing = true; }
-		else if (matchesKey(data, "c")) this.run(() => this.controller.cancelTask(), true);
-		else if (matchesKey(data, "q")) this.run(async () => { await this.controller.stop(); this.close("end"); }, true);
+		if (matchesKey(data, "escape")) {
+			if (this.input.getValue()) { this.input.setValue(""); this.error = ""; }
+			else { this.close(); return; }
+		} else if (matchesKey(data, "return")) {
+			const text = this.input.getValue();
+			if (text.trim()) this.submitText(text);
+			else this.toggleVoice();
+		} else if (matchesKey(data, "tab")) {
+			const targets = ["voice", "steer", "followUp"] as const;
+			this.target = targets[(targets.indexOf(this.target) + 1) % targets.length];
+			this.error = "";
+		} else if (matchesKey(data, "ctrl+t")) this.run(() => this.controller.mute(), true);
+		else if (matchesKey(data, "ctrl+x")) this.run(() => this.controller.interrupt(), true);
+		else if (matchesKey(data, "ctrl+g")) this.run(() => this.controller.cancelTask(), true);
+		else if (matchesKey(data, "ctrl+o")) this.settings = true;
+		else if (matchesKey(data, "ctrl+q")) this.run(async () => { await this.controller.stop(); this.close("end"); }, true);
+		else {
+			this.input.handleInput(data);
+			if (this.error && this.input.getValue()) this.error = "";
+		}
 		this.tui.requestRender();
 	}
 
@@ -171,7 +189,7 @@ export class TerminalVoicePanel implements Component {
 				["音色", this.snapshot.config.voice], ["API", this.snapshot.config.baseUrl],
 			]) lines.push(row(` ${label}  ${clean(value)}`));
 			lines.push(row(this.theme.fg("dim", " STEP_VOICE_REALTIME_MODEL / TTS_MODEL / VOICE 可自定义")));
-			lines.push(separator, row(this.theme.fg("dim", " Enter / S 返回  ·  R 重读进程环境  ·  Esc 收起")));
+			lines.push(separator, row(this.theme.fg("dim", " Enter / Esc 返回  ·  R 重读进程环境  ·  Ctrl+C 收起")));
 		} else {
 			const stateColor = this.snapshot.voice === "ready" ? "success" : this.snapshot.voice === "error" ? "error" : "accent";
 			lines.push(row(` ${this.theme.fg(stateColor, "●")} ${this.theme.fg(stateColor, voiceStateLabel(this.snapshot))}${this.pending ? this.theme.fg("dim", "  ·  正在处理") : ""}`));
@@ -187,7 +205,7 @@ export class TerminalVoicePanel implements Component {
 				const prefix = entry.role === "user" ? "你" : "Step";
 				return wrapTextWithAnsi(`${prefix}  ${clean(entry.text)}`, Math.max(1, inner - 2));
 			});
-			for (const line of transcript.length ? transcript.slice(-transcriptRows) : ["说出想法，或按 T 输入文字。", "按 G 将任务交给当前 Step Code。"])
+			for (const line of transcript.length ? transcript.slice(-transcriptRows) : ["说出想法，或直接在下方打字。", "按 Tab 可以把文字交给当前 Step Code 执行。"])
 				lines.push(row(` ${this.theme.fg("text", line)}`));
 			const agent = this.agentSnapshot();
 			lines.push(separator, heading(`Step Code  ·  ${agent.waitingForApproval ? "等待你确认" : agent.busy || agent.pending ? "后台工作中" : "等待任务"}`));
@@ -198,15 +216,12 @@ export class TerminalVoicePanel implements Component {
 			if (notice) for (const line of wrapTextWithAnsi(clean(notice), Math.max(1, inner - 2)).slice(0, 3))
 				lines.push(row(this.theme.fg(this.error || this.snapshot.notice?.kind === "error" ? "error" : "warning", ` ${line}`)));
 			lines.push(separator);
-			if (this.editing) {
-				const label = this.target === "voice" ? "语音对话" : this.target === "steer" ? "交给 Step Code" : "排入后续任务";
-				lines.push(row(this.theme.fg("accent", ` ${label} · Tab 切换 · Enter 发送 · Esc 取消`)));
-				this.input.focused = this.focused;
-				lines.push(row(` ${this.input.render(Math.max(1, inner - 2))[0] ?? ""}`));
-			} else {
-				lines.push(row(this.theme.fg("dim", " Enter 开始/结束 · M 静音 · I 打断 · T 文字 · G 任务")));
-				lines.push(row(this.theme.fg("dim", " S 设置 · C 停止任务 · Q 结束并收起 · Esc 收起保留通话")));
-			}
+			const label = this.target === "voice" ? "发给语音对话" : this.target === "steer" ? "交给 Step Code" : "排入后续任务";
+			lines.push(row(this.theme.fg("accent", ` ${label}`) + this.theme.fg("dim", " · Tab 切换 · Enter 发送（输入为空时开始/结束语音）")));
+			this.input.focused = this.focused;
+			lines.push(row(` ${this.input.render(Math.max(1, inner - 2))[0] ?? ""}`));
+			lines.push(row(this.theme.fg("dim", " Ctrl+T 静音 · Ctrl+X 打断 · Ctrl+G 停止任务 · Ctrl+O 设置")));
+			lines.push(row(this.theme.fg("dim", " Ctrl+Q 结束并收起 · Esc 收起（保留通话）")));
 		}
 		lines.push(this.theme.fg("borderMuted", `╰${"─".repeat(inner)}╯`));
 		return lines.map((line) => visibleWidth(line) > width ? truncateToWidth(line, width) : line);

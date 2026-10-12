@@ -39,6 +39,16 @@ func convert(_ input: AVAudioPCMBuffer, using converter: AVAudioConverter, outpu
     return result
 }
 
+/// Copies channel 0 of a float tap buffer into a mono buffer.
+func firstChannel(_ input: AVAudioPCMBuffer, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+    guard let source = input.floatChannelData, input.frameLength > 0,
+          let result = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: input.frameLength),
+          let target = result.floatChannelData else { return nil }
+    result.frameLength = input.frameLength
+    target[0].update(from: source[0], count: Int(input.frameLength))
+    return result
+}
+
 if CommandLine.arguments.contains("--self-test") {
     // Offline conversion only: no device, engine, or microphone permission request.
     let inputFormat = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
@@ -55,8 +65,17 @@ if CommandLine.arguments.contains("--self-test") {
         if drainStatus == .error { throw drainError ?? NSError(domain: "StepVoice", code: 4) }
         let bytes = pcmBytes(result) + pcmBytes(tail)
         let frames = result.frameLength + tail.frameLength
-        let passed = frames == 2400 && bytes.count == 4800
-        emit(["type": "selftest", "ok": passed, "sampleRate": 24000, "frames": frames, "bytes": bytes.count, "byteOrder": "little-endian", "permissionRequested": false])
+        // Regression: a 5-channel voice-processing buffer must still yield non-silent mono PCM.
+        let wideLayout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 5)!
+        let wideFormat = AVAudioFormat(standardFormatWithSampleRate: 48000, channelLayout: wideLayout)
+        let wide = AVAudioPCMBuffer(pcmFormat: wideFormat, frameCapacity: 4800)!
+        wide.frameLength = 4800
+        for channel in 0..<5 { for index in 0..<4800 { wide.floatChannelData![channel][index] = Float(sin(Double(index) * 0.04) * 0.4) } }
+        let wideConverter = AVAudioConverter(from: inputFormat, to: outputFormat)!
+        let wideResult = try convert(firstChannel(wide, format: inputFormat)!, using: wideConverter, outputFormat: outputFormat)
+        let multichannelAudible = pcmBytes(wideResult).contains { $0 != 0 }
+        let passed = frames == 2400 && bytes.count == 4800 && multichannelAudible
+        emit(["type": "selftest", "ok": passed, "multichannelAudible": multichannelAudible, "sampleRate": 24000, "frames": frames, "bytes": bytes.count, "byteOrder": "little-endian", "permissionRequested": false])
         exit(passed ? 0 : 1)
     } catch { fail("离线 PCM 转换失败：\(error.localizedDescription)") }
 }
@@ -80,7 +99,13 @@ final class VoiceAudio {
         catch { emit(["type": "notice", "message": "设备未启用系统回声消除，建议使用耳机。"] ) }
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0, let converter = AVAudioConverter(from: format, to: captureFormat) else {
+        // With voice processing on, macOS exposes the microphone as a multi-channel
+        // stream (5 channels on Apple-silicon MacBooks) without a channel layout.
+        // AVAudioConverter cannot downmix that and returns silence, so the tap
+        // takes channel 0 itself and the converter only resamples mono audio.
+        guard format.sampleRate > 0, format.channelCount > 0,
+              let monoFormat = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1),
+              let converter = AVAudioConverter(from: monoFormat, to: captureFormat) else {
             throw NSError(domain: "StepVoice", code: 3, userInfo: [NSLocalizedDescriptionKey: "没有可用麦克风，请检查系统声音输入设备"])
         }
         engine.attach(player)
@@ -91,7 +116,8 @@ final class VoiceAudio {
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self = self else { return }
             do {
-                let converted = try convert(buffer, using: converter, outputFormat: self.captureFormat)
+                guard let mono = firstChannel(buffer, format: monoFormat) else { return }
+                let converted = try convert(mono, using: converter, outputFormat: self.captureFormat)
                 self.captureLock.lock()
                 defer { self.captureLock.unlock() }
                 if self.muted || self.stopped { return }

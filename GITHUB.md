@@ -58,7 +58,7 @@ export STEP_API_KEY='你的 StepFun API Key'
 step
 ```
 
-进入后输入 `/voice`，按 Enter 或空格开始语音。打开插件面板不自动开启麦克风。Step Plan / OAuth 登录不能替代语音模型需要的开放平台 Key。
+进入后输入 `/voice`，在输入框为空时按 Enter 开始语音。打开插件面板不自动开启麦克风。Step Plan / OAuth 登录不能替代语音模型需要的开放平台 Key。
 
 从已安装依赖的 Step Code 源码仓库启动时，可把安装命令中的 `step` 换成 `pnpm step`，然后运行 `pnpm step`。
 
