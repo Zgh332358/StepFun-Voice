@@ -35,7 +35,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 const theme = { fg: (_color, text) => text, bold: (text) => text };
 const KEY = { ctrlT: "\x14", ctrlX: "\x18", ctrlG: "\x07", ctrlO: "\x0f", ctrlQ: "\x11", esc: "\x1b", tab: "\t", enter: "\r" };
 
-function runtime({ keyConfigured = true, setupDone = true, envKeyHint = "", start = async () => {}, save } = {}) {
+function runtime({ keyConfigured = true, setupDone = true, envKeyHint = "", start = async () => {}, save, rows = 48 } = {}) {
 	const state = {
 		connection: "connected", voice: "stopped", muted: false, micLevel: 0, speaking: false,
 		config: { baseUrl: "https://api.stepfun.com/v1", realtimeModel: "stepaudio-3-realtime-preview", ttsModel: "stepaudio-3-tts", voice: "linjiajiejie", keyConfigured, setupDone, envKeyHint, channel: "api", keySource: keyConfigured ? "env" : "", keyHint: "" },
@@ -66,7 +66,7 @@ function runtime({ keyConfigured = true, setupDone = true, envKeyHint = "", star
 		},
 		clearCredentials() { calls.cleared++; },
 	};
-	const panel = new TerminalVoicePanel({ terminal: { rows: 48 }, requestRender() { calls.renders++; } }, theme, controller, () => agent, (result) => calls.done.push(result));
+	const panel = new TerminalVoicePanel({ terminal: { rows }, requestRender() { calls.renders++; } }, theme, controller, () => agent, (result) => calls.done.push(result));
 	state.setup = { phase: "idle", message: "" };
 	return { panel, state, agent, calls, update };
 }
@@ -138,6 +138,14 @@ test("the microphone meter uses captured input level rather than assistant playb
 	} finally { r.panel.dispose(); }
 });
 
+test("compact terminals still show the live microphone meter", () => {
+	const r = runtime({ rows: 24 });
+	try {
+		r.state.voice = "ready"; r.state.micLevel = .6; r.update();
+		assert.match(r.panel.render(96).join("\n"), /麦克风.*60%/);
+	} finally { r.panel.dispose(); }
+});
+
 test("typed tasks preserve an explicit follow-up delivery choice through the native panel", async () => {
 	const r = runtime();
 	try {
@@ -200,7 +208,8 @@ test("typing goes straight into the text box while the microphone is listening",
 		assert.equal(r.calls.mute, 0); assert.equal(r.calls.interrupt, 0); assert.equal(r.calls.cancel, 0); assert.equal(r.calls.stop, 0);
 		assert.match(r.panel.render(104).join("\n"), /micqs 你好/);
 		r.panel.handleInput(KEY.enter); await tick();
-		assert.deepEqual(r.calls.text, ["micqs 你好"]);
+		assert.deepEqual(r.calls.tasks, [{ text: "micqs 你好", delivery: "followUp" }]);
+		assert.deepEqual(r.calls.text, []);
 		assert.equal(r.state.voice, "ready", "sending text must not end the call");
 		assert.doesNotMatch(r.panel.render(104).join("\n"), /micqs 你好/);
 	} finally { r.panel.dispose(); }
@@ -225,15 +234,15 @@ test("Enter on an empty box starts and ends the call; Ctrl shortcuts control it 
 	} finally { r.panel.dispose(); }
 });
 
-test("text for the voice conversation is kept with a hint when the call has not started", async () => {
+test("typing defaults directly to Step Code without opening voice; Tab explicitly selects steer", async () => {
 	const r = runtime();
 	try {
 		r.panel.handleInput("先记下这句"); r.panel.handleInput(KEY.enter); await tick();
 		assert.deepEqual(r.calls.text, []); assert.equal(r.calls.start, 0);
-		const view = r.panel.render(104).join("\n");
-		assert.match(view, /先记下这句/); assert.match(view, /语音还没开始/);
-		r.panel.handleInput(KEY.tab); r.panel.handleInput(KEY.enter); await tick();
-		assert.deepEqual(r.calls.tasks, [{ text: "先记下这句", delivery: "steer" }]);
+		assert.deepEqual(r.calls.tasks, [{ text: "先记下这句", delivery: "followUp" }]);
+		r.panel.handleInput(KEY.tab); r.panel.handleInput("补充说明"); r.panel.handleInput(KEY.enter); await tick();
+		assert.deepEqual(r.calls.tasks.at(-1), { text: "补充说明", delivery: "steer" });
+		assert.doesNotMatch(r.panel.render(104).join("\n"), /发给语音对话/);
 	} finally { r.panel.dispose(); }
 });
 
@@ -244,7 +253,7 @@ test("Ctrl+O opens settings and Enter returns to the conversation", () => {
 		const view = r.panel.render(104).join("\n");
 		assert.match(view, /接入设置/); assert.match(view, /开放平台 API/); assert.match(view, /K 更换通道或 Key/);
 		r.panel.handleInput(KEY.enter);
-		assert.match(r.panel.render(104).join("\n"), /发给语音对话/);
+		assert.match(r.panel.render(104).join("\n"), /Step Code · 后续任务/);
 		assert.equal(r.calls.start, 0);
 	} finally { r.panel.dispose(); }
 });

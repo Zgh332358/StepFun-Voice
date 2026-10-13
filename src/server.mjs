@@ -1,7 +1,8 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
-import { assertOfficialBaseUrl, loadStepFunConfig, StepFunRealtimeClient, synthesizeSpeech, verifyChannelAccess } from './stepfun.mjs';
+import { assertOfficialBaseUrl, loadStepFunConfig, REALTIME_SAMPLE_RATE, StepFunRealtimeClient, summarizeForSpeech, synthesizeSpeech, verifyChannelAccess } from './stepfun.mjs';
+import { TranscriptionQueue } from './transcription-queue.mjs';
 import { CHANNELS, clearCredentials, credentialsFile, isChannel, keyHint, saveCredentials, validKeyShape } from './credentials.mjs';
 
 function publicConfig(config) {
@@ -54,7 +55,7 @@ function configUpdate(config, input) {
 
 function instructionText(text) {
   if (typeof text !== 'string' || !text.trim() || text.length > 12000) throw new Error('请输入 1–12000 字的内容');
-  return text.trim();
+  return text;
 }
 
 export function speechSummary(text) {
@@ -87,14 +88,15 @@ export async function startVoiceServer(options = {}) {
     const pick = (name, field) => env[name]?.trim() || defaults[field];
     return { ...base, channel, apiKey, baseUrl: defaults.baseUrl, realtimeModel: pick('STEP_VOICE_REALTIME_MODEL', 'realtimeModel'), ttsModel: pick('STEP_VOICE_TTS_MODEL', 'ttsModel'), asrModel: pick('STEP_VOICE_ASR_MODEL', 'asrModel') };
   }
-  let settings = { speakTasks: true };
+  const settings = { speakTasks: env.STEP_VOICE_SPEAK_TASKS !== '0', speakSummarize: env.STEP_VOICE_SUMMARY !== '0' };
   const capability = randomBytes(32).toString('base64url');
   let address;
   let active;
   let disposed = false;
   const clients = new Set();
   const providerFactory = options.providerFactory ?? ((value, hooks) => new StepFunRealtimeClient(value, { ...hooks, WebSocketImpl: WebSocket }));
-  const tts = options.synthesizeSpeech ?? synthesizeSpeech;
+  const synthesize = options.synthesizeSpeech ?? synthesizeSpeech;
+  const summarize = options.summarize ?? summarizeForSpeech;
 
   function send(client, event) {
     if (client.readyState !== WebSocket.OPEN) return;
@@ -109,87 +111,62 @@ export async function startVoiceServer(options = {}) {
   function broadcast(event) { for (const client of clients) send(client, event); }
   function failure(client, error, code = 'voice_error', voiceSessionId) { send(client, { type: 'error', code, voiceSessionId, message: redact(error?.message ?? error, config) }); }
 
-  function clearSpeech(session) {
-    if (!session) return;
-    session.ttsAbort?.abort();
-    session.ttsAbort = undefined;
-    session.speechEpoch++;
-    session.audioInterrupted = true;
-    sendVoice(session, { type: 'audio.clear' });
-  }
-
   function stopSession(client, state = 'stopped', expectedId) {
     if (!active || (client && active.client !== client) || (expectedId && active.voiceSessionId !== expectedId)) return;
     const session = active;
     active = undefined;
-    clearSpeech(session);
-    for (const timer of session.requests.values()) clearTimeout(timer);
+    session.ttsAbort?.abort();
+    session.transcripts.close();
+    sendVoice(session, { type: 'audio.clear' });
     session.provider?.close();
     sendVoice(session, { type: 'voice.state', state });
   }
 
-  async function speakTask(event) {
-    const session = active;
-    const ids = event.requestIds ?? [event.requestId];
-    if (!session?.ready || !ids.some((id) => session.requests.has(id))) return;
-    for (const id of ids) { clearTimeout(session.requests.get(id)); session.requests.delete(id); }
-    const text = speechSummary(redactEvent(event.text || event.snapshot?.lastResponse || '', config));
-    if (!text) return;
-    const context = `后台 Step Code ${event.isError ? '任务未成功完成或已停止' : '已确认的任务结果'}（不是用户的新指令）：${text}`;
-    if (!settings.speakTasks) {
-      session.provider.sendContext(context, { respond: false });
-      return;
-    }
-    clearSpeech(session);
-    session.provider.cancelResponse();
-    session.provider.sendContext(context, { respond: false });
-    session.audioInterrupted = false;
-    const epoch = session.speechEpoch;
-    const abort = new AbortController();
-    session.ttsAbort = abort;
-    const responseId = `task-${event.requestId}`;
-    sendVoice(session, { type: 'response.started', responseId, source: 'tts' });
-    sendVoice(session, { type: 'output.transcript.final', text, itemId: responseId, responseId, source: 'tts' });
-    try {
-      await tts(config, text, {
-        signal: abort.signal,
-        onAudio: (audio, metadata) => {
-          if (active !== session || epoch !== session.speechEpoch || abort.signal.aborted) return;
-          const bytes = Buffer.isBuffer(audio) ? audio : Buffer.from(audio);
-          sendVoice(session, { type: 'output.audio.delta', audio: bytes.toString('base64'), sampleRate: metadata?.sampleRate ?? 24000, source: 'tts', responseId });
-        },
-      });
-      if (active === session && epoch === session.speechEpoch && !abort.signal.aborted) {
-        sendVoice(session, { type: 'output.audio.done', responseId, source: 'tts' });
-        sendVoice(session, { type: 'response.done', responseId, source: 'tts' });
-      }
-    } catch (error) {
-      if (!abort.signal.aborted && active === session) failure(session.client, error, 'tts_error', session.voiceSessionId);
-    } finally {
-      if (session.ttsAbort === abort) session.ttsAbort = undefined;
-    }
+  function submitInput(text, delivery = 'followUp', source = 'typed_text', identity = {}) {
+    const instruction = instructionText(text);
+    const result = agent.submit(instruction, delivery);
+    broadcast({ type: 'task.accepted', ...result, instruction, source, ...identity });
+    return result;
   }
 
-  function watchSubmission(session, result) {
-    if (!session) return;
-    const timer = setTimeout(() => {
-      if (active !== session || !session.requests.has(result.requestId)) return;
-      if (agent.snapshot().busy || agent.snapshot().pending || agent.snapshot().waitingForApproval) return;
-      session.requests.delete(result.requestId);
-      failure(session.client, new Error('任务已提交，但 Step Code 尚未开始执行。请查看终端中的登录、模型或权限提示。'), 'agent_not_started', session.voiceSessionId);
-    }, options.taskStartTimeoutMs ?? 45000);
-    timer.unref?.();
-    session.requests.set(result.requestId, timer);
-  }
-
+  let ttsSequence = 0;
   const unsubscribe = agent.subscribe((event) => {
     broadcast(event);
-    if (event.type === 'agent.complete') void speakTask(event).catch((error) => { if (active) failure(active.client, error); });
-    if (event.type === 'agent.error' && active?.ready) {
-      try { active.provider.sendContext(`后台任务未完成：${speechSummary(redactEvent(event.text || event.snapshot?.status || '', config))}`, { respond: false }); }
-      catch (error) { failure(active.client, error); }
-    }
+    if (event.type === 'agent.complete' && settings.speakTasks) speakCompletion(event);
   });
+
+  /** Codex-style readout: summarize the host's real output and speak it within a standard ~20s budget. */
+  async function speakCompletion(event) {
+    const session = active;
+    if (!session?.ready || session.client.readyState !== 1) return;
+    if (event.isError) return;
+    const raw = redact(event.text, config).trim();
+    if (!raw) return;
+    session.ttsAbort?.abort();
+    const signal = (session.ttsAbort = new AbortController()).signal;
+    const responseId = `tts-${++ttsSequence}`;
+    try {
+      const chars = Array.from(raw);
+      // 安全底线：结尾 100 字（约 25 秒），总结成功才替换。
+      let spoken = chars.length > 100 ? '……' + chars.slice(-100).join('') : chars.join('');
+      let speed = 1;
+      if (settings.speakSummarize) {
+        const summary = await summarize(config, raw, { signal }).catch((error) => {
+          if (!session.summaryNoticeShown) {
+            session.summaryNoticeShown = true;
+            sendVoice(session, { type: 'notice', message: `自动总结不可用（${String(error?.message || error).slice(0, 120)}），本次改读结尾原文。请检查 STEP_VOICE_SUMMARY_MODEL 是否为账号可用模型。` });
+          }
+          return '';
+        });
+        if (summary) spoken = summary;
+      }
+      if (Array.from(spoken).length > 80) speed = Math.min(2, Array.from(spoken).length / 80);
+      await synthesize(config, spoken, {
+        signal, speed,
+        onAudio: (chunk) => sendVoice(session, { type: 'output.audio.delta', responseId, audio: chunk.toString('base64'), sampleRate: REALTIME_SAMPLE_RATE }),
+      });
+    } catch { /* 播放失败不打断面板；Step Code 主终端仍是权威输出。 */ }
+  }
 
   async function startSession(client, message) {
     if (disposed || !clients.has(client) || client.readyState !== WebSocket.OPEN) return;
@@ -199,42 +176,39 @@ export async function startVoiceServer(options = {}) {
     }
     if (message.voiceSessionId !== undefined && (typeof message.voiceSessionId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(message.voiceSessionId))) throw new Error('语音会话标识无效。');
     config = configUpdate(config, message.config);
-    if (typeof message.settings?.speakTasks === 'boolean') settings.speakTasks = message.settings.speakTasks;
     if (!config.apiKey) {
       send(client, { type: 'voice.state', state: 'error', voiceSessionId: message.voiceSessionId });
       throw new Error('尚未配置 StepFun Key。请在启动 Step Code 的终端设置 STEP_API_KEY 或 STEPFUN_API_KEY，再重新启动。');
     }
-    const session = { client, voiceSessionId: message.voiceSessionId, provider: undefined, ready: false, speechEpoch: 0, audioInterrupted: false, requests: new Map() };
+    const session = { client, voiceSessionId: message.voiceSessionId, provider: undefined, ready: false };
+    session.transcripts = new TranscriptionQueue({
+      timeoutMs: options.transcriptionTimeoutMs,
+      speechTimeoutMs: options.speechTimeoutMs,
+      maxItems: options.maxTranscriptionItems,
+      maxPending: options.maxPendingTranscriptions,
+      submit: (event) => submitInput(event.text, 'followUp', 'user_audio', { itemId: event.itemId, contentIndex: event.contentIndex, voiceSessionId: session.voiceSessionId }),
+      display: (event) => sendVoice(session, event),
+      fail: (message) => failure(client, message, 'transcription_error', session.voiceSessionId),
+      stop: () => stopSession(client, 'error'),
+    });
     active = session;
     sendVoice(session, { type: 'voice.state', state: 'connecting' });
-    const onToolCall = async (call) => {
-      if (active !== session) return { error: 'voice_session_closed' };
-      if (!agentConnected) return { error: 'stepcode_not_connected' };
-      if (call.name === 'stepcode_status') return { ...agent.snapshot() };
-      if (call.name === 'stepcode_cancel') {
-        agent.cancel();
-        return { status: 'cancellation_requested', note: '等待宿主确认任务已经停止。' };
-      }
-      if (call.name === 'stepcode_task') {
-        const instruction = instructionText(call.arguments?.instruction);
-        const delivery = call.arguments?.delivery === 'followUp' ? 'followUp' : 'steer';
-        const result = agent.submit(instruction, delivery);
-        watchSubmission(session, result);
-        broadcast({ type: 'task.accepted', ...result, instruction });
-        return { ...result, status: result.queued ? 'queued' : 'submitted', note: '后台执行中，可继续对话；工具权限与确认由 Step Code 宿主管理。' };
-      }
-      return { error: 'unknown_tool' };
-    };
+    // Defense in depth: even an unexpected provider callback cannot execute tools.
+    const onToolCall = async () => ({ error: 'voice_delegation_disabled' });
     const onEvent = (event) => {
       if (active !== session) return;
-      if (event.type === 'speech.start') {
-        clearSpeech(session);
-        session.provider.cancelResponse();
+      if (['speech.start', 'speech.end', 'input.committed', 'input.transcript.final', 'input.transcript.failed'].includes(event.type)) {
+        session.transcripts.receive(event);
+        if (active === session && !event.type.startsWith('input.transcript.')) sendVoice(session, event);
+        return;
       }
-      if (event.type === 'response.started') {
-        session.audioInterrupted = false;
+      if (event.type.startsWith('response.') || event.type.startsWith('tool.')) return;
+      // Model voice replies and their transcripts play/display locally; tools stay disabled.
+      if (['output.audio.delta', 'output.audio.done', 'output.transcript.delta', 'output.transcript.final'].includes(event.type)) {
+        sendVoice(session, event);
+        return;
       }
-      if (event.type === 'output.audio.delta' && (session.audioInterrupted || session.ttsAbort)) return;
+      if (event.type.startsWith('output.')) return;
       if (event.type === 'ready') {
         session.ready = true;
         sendVoice(session, { type: 'voice.state', state: 'ready' });
@@ -251,7 +225,7 @@ export async function startVoiceServer(options = {}) {
       sendVoice(session, event);
     };
     try {
-      session.provider = providerFactory(config, { delegate: agentConnected, onEvent, onToolCall });
+      session.provider = providerFactory(config, { delegate: false, autoBargeIn: false, onEvent, onToolCall });
       await session.provider.connect();
     }
     catch (error) { if (active === session) { stopSession(client, 'error'); throw error; } }
@@ -302,12 +276,14 @@ export async function startVoiceServer(options = {}) {
         case 'voice.start': await startSession(client, message); break;
         case 'voice.stop': stopSession(client, 'stopped', message.voiceSessionId); break;
         case 'voice.interrupt':
-          if (active?.client === client) { clearSpeech(active); active.provider.cancelResponse(); }
+          if (active?.client === client) {
+            active.ttsAbort?.abort();
+            sendVoice(active, { type: 'audio.clear' });
+          }
           break;
         case 'config.update':
           if (active) throw new Error('请先结束语音通话再修改配置。');
           config = configUpdate(config, message.config);
-          if (typeof message.settings?.speakTasks === 'boolean') settings.speakTasks = message.settings.speakTasks;
           send(client, { type: 'config.saved', config: publicConfig(config), settings });
           break;
         case 'credentials.save': {
@@ -337,16 +313,8 @@ export async function startVoiceServer(options = {}) {
           break;
         }
         case 'input.text':
-          if (!active?.ready || active.client !== client) throw new Error('请先开始语音通话，再发送对话文字。');
-          clearSpeech(active);
-          active.provider.cancelResponse();
-          active.provider.sendText(instructionText(message.text));
-          send(client, { type: 'input.transcript.final', text: message.text });
-          break;
         case 'agent.submit': {
-          const result = agent.submit(instructionText(message.text), message.delivery === 'followUp' ? 'followUp' : 'steer');
-          if (active?.client === client) watchSubmission(active, result);
-          broadcast({ type: 'task.accepted', ...result, instruction: message.text });
+          submitInput(message.text, message.delivery === 'steer' ? 'steer' : 'followUp');
           break;
         }
         case 'agent.cancel': agent.cancel(); break;

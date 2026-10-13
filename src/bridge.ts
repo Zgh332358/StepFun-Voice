@@ -18,7 +18,7 @@ function assistantText(message: unknown): string {
 		.slice(-MAX_TEXT_LENGTH);
 }
 
-export function createVoiceAgentBridge(pi: ExtensionAPI): {
+export function createVoiceAgentBridge(pi: ExtensionAPI, { taskStartTimeoutMs = 45000 } = {}): {
 	agent: VoiceAgentBridge;
 	setContext(context: ExtensionContext): void;
 	setVoicePanelOpen(open: boolean): void;
@@ -32,6 +32,11 @@ export function createVoiceAgentBridge(pi: ExtensionAPI): {
 	let cancelled = false;
 	let requestId: string | undefined;
 	const pendingRequestIds = new Set<string>();
+	const startTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	const clearStartTimers = (): void => {
+		for (const timer of startTimers.values()) clearTimeout(timer);
+		startTimers.clear();
+	};
 	let activeRun = false;
 	let waitingPrompts = 0;
 	let voicePanelOpen = false;
@@ -70,9 +75,9 @@ export function createVoiceAgentBridge(pi: ExtensionAPI): {
 		};
 	};
 
-	const emit = (event: Omit<VoiceAgentEvent, "snapshot" | "requestId">): void => {
+	const emit = (event: Omit<VoiceAgentEvent, "snapshot">): void => {
 		if (disposed) return;
-		const update: VoiceAgentEvent = { ...event, snapshot: snapshot(), requestId };
+		const update: VoiceAgentEvent = { snapshot: snapshot(), requestId, ...event };
 		for (const listener of listeners) {
 			try {
 				listener(update);
@@ -86,25 +91,55 @@ export function createVoiceAgentBridge(pi: ExtensionAPI): {
 		if (!disposed) context = ctx;
 	};
 
+	const watchStart = (id: string): void => {
+		const timer = setTimeout(() => {
+			startTimers.delete(id);
+			if (disposed || !context || !pendingRequestIds.has(id)) return;
+			// Queued work can legitimately wait on a running task or permission.
+			// A pending flag alone is NOT evidence that the host started execution.
+			if (!context.isIdle() || waitingPrompts > 0) { watchStart(id); return; }
+			pendingRequestIds.delete(id);
+			status = "未观察到 Step Code 开始执行；请核对主终端";
+			emit({ type: "agent.error", requestId: id, requestIds: [id], isError: true,
+				text: "任务已尝试提交，但 Step Code 尚未开始执行。请查看主终端的登录、模型或权限提示；接受结果不确定，未自动重试。" });
+			if (requestId === id) requestId = undefined;
+		}, taskStartTimeoutMs);
+		timer.unref?.();
+		startTimers.set(id, timer);
+	};
+
 	const agent: VoiceAgentBridge = {
 		snapshot,
-		submit(text, delivery = "steer") {
+		submit(text, delivery = "followUp") {
 			const ctx = requireContext();
-			const prompt = text.trim();
-			if (!prompt) throw new Error("请说出要交给 Step Code 的任务。");
+			const prompt = text;
+			if (!prompt.trim()) throw new Error("请说出要交给 Step Code 的任务。");
 			if (prompt.length > MAX_TEXT_LENGTH) throw new Error("语音任务过长，请拆成几段后发送。");
 			if (delivery !== "steer" && delivery !== "followUp") throw new Error("无效的任务发送方式。");
 			if (!ctx.model) throw new Error("Step Code 尚未选择模型。请在终端配置模型后重试。");
-			requestId = randomUUID();
-			pendingRequestIds.add(requestId);
+			const previousRequestId = requestId;
+			const id = randomUUID();
+			requestId = id;
+			pendingRequestIds.add(id);
 			const queued = !ctx.isIdle();
+			if (!queued) lastResponse = "";
 			lastError = "";
 			cancelled = false;
 			status = queued ? (delivery === "steer" ? "已排入补充指令" : "已排入后续任务") : "已发送语音任务";
-			// Host dispatch retains its tool permission gates. Slash commands are not expanded.
-			pi.sendUserMessage(prompt, { deliverAs: delivery, expandPromptTemplates: false });
+			watchStart(id);
+			// This API returns void; only host events confirm that execution started.
+			try {
+				pi.sendUserMessage(prompt, { deliverAs: delivery, expandPromptTemplates: false });
+			} catch (error) {
+				clearTimeout(startTimers.get(id)); startTimers.delete(id);
+				pendingRequestIds.delete(id);
+				status = "提交 Step Code 失败或结果不确定，未自动重试";
+				emit({ type: "agent.error", requestId: id, isError: true, text: `${status}：${error instanceof Error ? error.message : String(error)}` });
+				requestId = previousRequestId;
+				throw error;
+			}
 			emit({ type: "agent.status" });
-			return { requestId, queued };
+			return { requestId: id, queued };
 		},
 		cancel() {
 			const ctx = requireContext();
@@ -134,11 +169,14 @@ export function createVoiceAgentBridge(pi: ExtensionAPI): {
 		activeTools = new Set();
 		requestId = undefined;
 		pendingRequestIds.clear();
+		clearStartTimers();
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
 		setContext(ctx);
 		activeRun = true;
+		clearStartTimers();
+		lastTextAt = 0;
 		lastResponse = "";
 		lastError = "";
 		cancelled = false;
@@ -237,6 +275,7 @@ export function createVoiceAgentBridge(pi: ExtensionAPI): {
 			requestIds: [...pendingRequestIds],
 		});
 		pendingRequestIds.clear();
+		clearStartTimers();
 		requestId = undefined;
 	});
 
@@ -248,6 +287,8 @@ export function createVoiceAgentBridge(pi: ExtensionAPI): {
 		},
 		dispose() {
 			disposed = true;
+			clearStartTimers();
+			pendingRequestIds.clear();
 			context = undefined;
 			listeners.clear();
 		},

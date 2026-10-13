@@ -67,7 +67,8 @@ export class NativeAudioEngine {
     if (epoch !== this.epoch) return;
     this.hooks.onStatus?.('permission');
     const spawnImpl = this.options.spawnImpl ?? spawn;
-    const child = spawnImpl(binary, [], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '', TMPDIR: process.env.TMPDIR ?? tmpdir(), LANG: process.env.LANG ?? 'en_US.UTF-8' } });
+    const args = process.env.STEP_VOICE_ECHO_CANCEL === '1' ? ['--echo-cancel'] : [];
+    const child = spawnImpl(binary, args, { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '', TMPDIR: process.env.TMPDIR ?? tmpdir(), LANG: process.env.LANG ?? 'en_US.UTF-8' } });
     this.child = child;
     let diagnostics = '';
     child.stderr.on('data', (data) => { diagnostics = (diagnostics + String(data)).slice(-1500); });

@@ -8,6 +8,7 @@ import {
 	readSseEvents,
 	sanitizeProviderError,
 	StepFunRealtimeClient,
+	summarizeForSpeech,
 	synthesizeSpeech,
 	transcribeAudio,
 } from "../src/stepfun.mjs";
@@ -44,6 +45,9 @@ class FakeWebSocket extends EventEmitter {
 async function connected(options = {}) {
 	const events = [];
 	const client = new StepFunRealtimeClient(config(), {
+		// Exercise the retained low-level helper's explicit delegation path here;
+		// the relay and default client use transcription-only mode (tested below).
+		delegate: true,
 		WebSocketImpl: FakeWebSocket,
 		onEvent: (event) => events.push(event),
 		...options,
@@ -55,6 +59,32 @@ async function connected(options = {}) {
 	await ready;
 	return { client, events, socket: client.socket };
 }
+
+test('transcription-only client forwards native identity and never executes tools or cancels generated output', async () => {
+	let tools = 0;
+	const { client, socket, events } = await connected({ delegate: false, autoBargeIn: false, onToolCall: () => tools++ });
+	assert.deepEqual(socket.sent[0].session.tools, []);
+	const sent = socket.sent.length;
+	socket.receive({ type: 'input_audio_buffer.speech_started', item_id: 'input-1', audio_start_ms: 0 });
+	socket.receive({ type: 'input_audio_buffer.speech_stopped', item_id: 'input-1', audio_end_ms: 1000 });
+	socket.receive({ type: 'input_audio_buffer.committed', item_id: 'input-1', previous_item_id: 'input-0' });
+	for (const type of ['response.created', 'response.audio.delta', 'response.text.done', 'response.audio_transcript.done', 'response.function_call_arguments.done', 'response.done']) {
+		socket.receive({ type, response: { id: 'response-1' }, item_id: 'assistant-1', call_id: 'call-1', name: 'stepcode_task', arguments: '{"instruction":"not authorized"}', text: 'generated', delta: 'AAA=' });
+	}
+	socket.receive({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'input-1', content_index: 0, transcript: '  原文  ' });
+	socket.receive({ type: 'conversation.item.input_audio_transcription.failed', item_id: 'input-2', content_index: 0, error: { message: 'failed' } });
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(tools, 0);
+	assert.equal(socket.sent.length, sent, 'do not cancel generated responses or send tool results');
+	assert.equal(events.some(event => /^(output|response|tool)\./.test(event.type)), false);
+	const transcript = events.find(event => event.type === 'input.transcript.final');
+	assert.equal(transcript.itemId, 'input-1'); assert.equal(transcript.contentIndex, 0);
+	assert.equal(transcript.source, 'user_audio'); assert.equal(transcript.text, '  原文  ');
+	assert.equal(events.find(event => event.type === 'input.committed').previousItemId, 'input-0');
+	assert.equal(events.at(-1).type, 'input.transcript.failed');
+	assert.equal(events.at(-1).itemId, 'input-2');
+	client.close();
+});
 
 function sseResponse(events, { fragmentSize = 3, status = 200 } = {}) {
 	const encoded = new TextEncoder().encode(events.map((event) => `data: ${JSON.stringify(event)}\r\n\r\n`).join(""));
@@ -100,11 +130,9 @@ test("session schema matches StepFun nested function API and does not add undocu
 	assert.deepEqual(session.modalities, ["text", "audio"]);
 	assert.equal(session.input_audio_format, "pcm16");
 	assert.equal(session.output_audio_format, "pcm16");
-	assert.deepEqual(
-		session.tools.map((tool) => tool.function.name),
-		["stepcode_task", "stepcode_status", "stepcode_cancel"],
-	);
-	assert.ok(session.tools.every((tool) => tool.type === "function" && !tool.name));
+	assert.deepEqual(session.tools, []);
+	assert.deepEqual(createRealtimeSession(config(), { delegate: true }).tools.map(tool => tool.function.name),
+		["stepcode_task", "stepcode_status", "stepcode_cancel"]);
 	assert.equal(session.turn_detection.type, "server_vad");
 	assert.ok(!("input_audio_transcription" in session));
 	assert.deepEqual(createRealtimeSession(config(), { delegate: false }).tools, []);
@@ -653,4 +681,29 @@ test("channels: Step Plan uses its own base URL and 2.5 models; the panel Key wi
 	assert.equal(result.apiKey, "env-key-0000000000000000"); assert.equal(result.keySource, "env"); assert.equal(result.setupDone, true);
 	assert.equal(loadSavedCredentials({ STEP_VOICE_HOME: join(home, "missing") }), undefined);
 	assert.equal(loadStepFunConfig({ STEP_VOICE_BASE_URL: "https://api.stepfun.com/step_plan/v1" }).realtimeModel, "stepaudio-2.5-realtime");
+});
+
+test("summarizeForSpeech short-circuits short text and uses the configured chat model for long text", async () => {
+	const speechConfig = { apiKey: "test-key-never-real", baseUrl: "https://api.stepfun.com/v1", summaryModel: "step-2-mini" };
+	assert.equal(await summarizeForSpeech(speechConfig, "短结果"), "短结果");
+	const bodies = [];
+	const fetchImpl = async (url, init) => {
+		bodies.push({ url, body: JSON.parse(init.body) });
+		return { ok: true, json: async () => ({ choices: [{ message: { content: "这是摘要" } }] }) };
+	};
+	assert.equal(await summarizeForSpeech(speechConfig, "x".repeat(200), { fetchImpl }), "这是摘要");
+	assert.equal(bodies.length, 1);
+	assert.equal(bodies[0].url, "https://api.stepfun.com/v1/chat/completions");
+	assert.equal(bodies[0].body.model, "step-2-mini");
+	assert.equal(bodies[0].body.messages[1].content, "x".repeat(200));
+});
+
+test("summarizeForSpeech surfaces provider errors and strips code fences", async () => {
+	const speechConfig = { apiKey: "test-key-never-real", baseUrl: "https://api.stepfun.com/v1", summaryModel: "step-2-mini" };
+	const fetchImpl = async () => ({ ok: false, status: 429, text: async () => JSON.stringify({ error: { message: "quota exceeded" } }), json: async () => ({ error: { message: "quota exceeded" } }) });
+	await assert.rejects(() => summarizeForSpeech(speechConfig, "x".repeat(200), { fetchImpl }), /quota exceeded/);
+	const fenceFetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "```js\nconsole.log(1);\n``` 摘要完成" } }] }) });
+	const summary = await summarizeForSpeech(speechConfig, "x".repeat(200), { fetchImpl: fenceFetch });
+	assert.equal(summary.includes("```"), false);
+	assert.equal(summary.trim(), "摘要完成");
 });

@@ -80,6 +80,11 @@ if CommandLine.arguments.contains("--self-test") {
     } catch { fail("离线 PCM 转换失败：\(error.localizedDescription)") }
 }
 
+/// Voice processing (system echo cancellation) poisons input delivery on some
+/// macOS setups: once enabled, input taps stop receiving callbacks entirely,
+/// so it is opt-in via --echo-cancel and capture starts plain by default.
+let echoCancelRequested = CommandLine.arguments.contains("--echo-cancel")
+
 final class VoiceAudio {
     let engine = AVAudioEngine()
     let player = AVAudioPlayerNode()
@@ -92,12 +97,14 @@ final class VoiceAudio {
     var pendingFrames = 0
     var stopped = false
     var installedTap = false
+    var tapFrames = 0
 
     func start() throws {
-        // Voice processing supplies echo cancellation when the device supports it.
-        do { try engine.inputNode.setVoiceProcessingEnabled(true) }
-        catch { emit(["type": "notice", "message": "设备未启用系统回声消除，建议使用耳机。"] ) }
         let input = engine.inputNode
+        if echoCancelRequested {
+            do { try input.setVoiceProcessingEnabled(true) }
+            catch { emit(["type": "notice", "message": "设备未启用系统回声消除，建议使用耳机。"] ) }
+        }
         let format = input.outputFormat(forBus: 0)
         // With voice processing on, macOS exposes the microphone as a multi-channel
         // stream (5 channels on Apple-silicon MacBooks) without a channel layout.
@@ -120,6 +127,7 @@ final class VoiceAudio {
                 let converted = try convert(mono, using: converter, outputFormat: self.captureFormat)
                 self.captureLock.lock()
                 defer { self.captureLock.unlock() }
+                self.tapFrames += Int(buffer.frameLength)
                 if self.muted || self.stopped { return }
                 self.pendingPCM.append(pcmBytes(converted))
                 // 40 ms frames keep the IPC/upstream rate at 25 frames per second.
@@ -144,6 +152,22 @@ final class VoiceAudio {
         try engine.start()
         player.play()
         emit(["type": "ready", "inputSampleRate": format.sampleRate, "sampleRate": 24000, "voiceProcessing": input.isVoiceProcessingEnabled])
+        scheduleInputWatchdog()
+    }
+
+    /// A running engine with zero input frames means capture is starved
+    /// (device routing, permissions, or a poisoned aggregate); surface it
+    /// instead of showing "listening" forever at 0%.
+    func scheduleInputWatchdog() {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self = self, !self.stopped else { return }
+            self.captureLock.lock()
+            let frames = self.tapFrames
+            self.captureLock.unlock()
+            if frames == 0 {
+                emit(["type": "notice", "message": "麦克风已打开但 3 秒内未收到任何数据：请到 系统设置→声音→输入 重新选择一次输入设备，再重启语音。"])
+            }
+        }
     }
 
     func setMuted(_ value: Bool) {
@@ -170,7 +194,8 @@ final class VoiceAudio {
         let frameCount = data.count / 2
         guard pendingFrames + frameCount < 24000 * 30 else {
             clear()
-            emit(["type": "error", "message": "待播放音频超过 30 秒，已清空，请继续对话。"])
+            // 溢出不是致命错误：采集与会话都还活着，只清播放队列并提示。
+            emit(["type": "notice", "message": "待播放音频超过 30 秒，已清空播放队列。"])
             return
         }
         let buffer = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: AVAudioFrameCount(frameCount))!

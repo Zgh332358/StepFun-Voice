@@ -83,22 +83,38 @@ test("explicit start captures mono PCM frames only while upstream ready and micr
 	await r.controller.dispose(); assert.ok(r.engines[0].stops >= 1);
 });
 
-test("mute continues speaker playback; interrupt clears native queue and rejects late response audio", async () => {
+test("realtime voice replies play back, duck the mic without AEC, and fence interrupted responses", async () => {
 	const r = runtime(); await r.startReady();
-	r.emit({ type: "response.started", responseId: "first" });
 	r.controller.setMuted(true);
-	r.emit({ type: "output.audio.delta", responseId: "first", audio: PCM, sampleRate: 48000 });
-	assert.deepEqual(r.engines[0].played, [{ audio: PCM, sampleRate: 48000 }]);
+	r.emit({ type: "output.audio.delta", responseId: "first", audio: PCM, sampleRate: 24000 });
+	assert.deepEqual(r.engines[0].played, [{ audio: PCM, sampleRate: 24000 }]);
+	assert.equal(r.controller.snapshot().speaking, true);
+	assert.deepEqual(r.engines[0].muted, [true, true]);
 	r.controller.interrupt();
 	assert.equal(r.messages.at(-1).type, "voice.interrupt");
 	assert.equal(r.controller.snapshot().speaking, false);
-	r.emit({ type: "output.audio.delta", responseId: "first", audio: PCM, sampleRate: 24000 });
-	r.emit({ type: "output.audio.delta", audio: PCM, sampleRate: 24000 });
+	r.emit({ type: "output.audio.delta", responseId: "first", audio: PCM });
 	assert.equal(r.engines[0].played.length, 1);
-	r.emit({ type: "response.started", responseId: "second" });
-	r.emit({ type: "output.audio.delta", responseId: "second", audio: PCM, sampleRate: 24000 });
+	r.emit({ type: "output.audio.delta", responseId: "second", audio: PCM });
 	assert.equal(r.engines[0].played.length, 2);
-	assert.ok(r.engines[0].clears >= 1);
+	await r.controller.dispose();
+});
+
+test("model speech transcript is display-only and echo-cancel mode keeps the mic open", async () => {
+	process.env.STEP_VOICE_ECHO_CANCEL = "1";
+	let r;
+	try {
+		r = runtime(); await r.startReady();
+		r.emit({ type: "output.transcript.delta", responseId: "r1", text: "正在" });
+		r.emit({ type: "output.transcript.final", responseId: "r1", text: "正在分析代码。" });
+		r.emit({ type: "output.audio.delta", responseId: "r1", audio: PCM });
+		const lines = r.controller.snapshot().transcripts.filter((entry) => entry.source === "model_audio");
+		assert.equal(lines.length, 1);
+		assert.equal(lines[0].role, "assistant");
+		assert.equal(lines[0].text, "正在分析代码。");
+		assert.equal(r.engines[0].played.length, 1);
+		assert.equal(r.engines[0].muted.includes(true), false);
+	} finally { delete process.env.STEP_VOICE_ECHO_CANCEL; }
 	await r.controller.dispose();
 });
 
@@ -112,21 +128,20 @@ test("automatic speech barge-in clears playback without cancelling the backgroun
 	await r.controller.dispose();
 });
 
-test("text is echoed once by server; streamed subtitles settle and TTS starts a fresh response", async () => {
+test("native final is display-only, typed ack echoes once and generated replies stay isolated", async () => {
 	const r = runtime(); await r.startReady(); r.controller.sendText("你好");
 	assert.equal(r.controller.snapshot().transcripts.length, 0);
-	r.emit({ type: "input.transcript.final", text: "你好" });
-	r.emit({ type: "response.started", responseId: "r1" });
-	r.emit({ type: "output.transcript.delta", itemId: "i1", responseId: "r1", text: "你好，" });
-	r.emit({ type: "output.transcript.delta", itemId: "i1", responseId: "r1", text: "我在听。" });
-	r.emit({ type: "output.transcript.final", itemId: "i1", responseId: "r1", text: "你好，我在听。" });
-	r.emit({ type: "response.done", responseId: "r1" });
-	assert.deepEqual(r.controller.snapshot().transcripts.map((entry) => entry.text), ["你好", "你好，我在听。"]);
-	r.emit({ type: "audio.clear" });
-	r.emit({ type: "response.started", responseId: "task-1", source: "tts" });
-	r.emit({ type: "output.transcript.final", responseId: "task-1", itemId: "task-1", text: "任务已完成", source: "tts" });
-	r.emit({ type: "output.audio.delta", responseId: "task-1", audio: PCM, source: "tts" });
-	assert.equal(r.controller.snapshot().transcripts.at(-1).source, "tts");
+	r.emit({ type: "task.accepted", source: "typed_text", requestId: "typed-1", instruction: "你好" });
+	r.emit({ type: "task.accepted", source: "typed_text", requestId: "typed-1", instruction: "你好" });
+	const audioFinal = { type: "input.transcript.final", source: "user_audio", itemId: "audio-1", contentIndex: 0, text: "语音输入" };
+	const sends = r.messages.length;
+	r.emit(audioFinal); r.emit(audioFinal);
+	assert.equal(r.messages.length, sends, 'controller must never submit native final');
+	for (const type of ['response.started', 'output.transcript.delta', 'output.transcript.final', 'output.audio.delta', 'response.done']) {
+		r.emit({ type, text: '模型代答', audio: PCM, responseId: 'r1' });
+	}
+	assert.deepEqual(r.controller.snapshot().transcripts.map(entry => entry.text), ['你好', '语音输入', '模型代答']);
+	assert.deepEqual(r.controller.snapshot().transcripts.map(entry => entry.source), ['typed_text', 'user_audio', 'model_audio']);
 	assert.equal(r.engines[0].played.length, 1);
 	await r.controller.dispose();
 });
@@ -196,30 +211,36 @@ test("invalid PCM packets are rejected before native playback", async () => {
 	const r = runtime(); await r.startReady();
 	r.emit({ type: "response.started", responseId: "r1" });
 	r.emit({ type: "output.audio.delta", responseId: "r1", audio: Buffer.from([1]).toString("base64") });
-	assert.equal(r.engines[0].played.length, 0); assert.match(r.controller.snapshot().notice.text, /PCM16/);
+	assert.equal(r.engines[0].played.length, 0); assert.equal(r.controller.snapshot().notice, undefined);
 	await r.controller.dispose();
 });
 
-test("failed response termination exposes provider diagnosis without a separate error event", async () => {
+test("Realtime response failures are isolated; native transcription errors remain visible", async () => {
 	const r = runtime(); await r.startReady();
 	r.emit({ type: "response.started", responseId: "r1" });
 	r.emit({ type: "response.done", responseId: "r1", status: "failed", statusDetails: { error: { message: "Model access denied" } } });
+	assert.equal(r.controller.snapshot().notice, undefined);
+	r.emit({ type: 'error', code: 'transcription_error', message: '语音转写失败，本段未提交' });
 	assert.equal(r.controller.snapshot().notice.kind, "error");
-	assert.match(r.controller.snapshot().notice.text, /Model access denied/);
+	assert.match(r.controller.snapshot().notice.text, /转写失败.*未提交/);
 	assert.equal(r.controller.snapshot().voice, "ready");
 	await r.controller.dispose();
 });
 
-test("late cancellation of an old response cannot split the new streaming transcript", async () => {
-	const r = runtime(); await r.startReady();
-	r.emit({ type: "response.started", responseId: "old" }); r.controller.interrupt();
-	r.emit({ type: "response.started", responseId: "new" });
-	r.emit({ type: "output.transcript.delta", responseId: "new", text: "新的" });
-	r.emit({ type: "response.done", responseId: "old", status: "cancelled" });
-	r.emit({ type: "output.transcript.delta", responseId: "new", text: "回复" });
-	assert.equal(r.controller.snapshot().transcripts.length, 1);
-	assert.equal(r.controller.snapshot().transcripts[0].text, "新的回复");
-	assert.equal(r.controller.snapshot().transcripts[0].final, false);
+test("new host snapshots clear old preview and failures survive a hidden panel", async () => {
+	const r = runtime(); await r.ready();
+	r.emit({ type: 'agent.text', text: 'previous result', snapshot: { lastResponse: 'previous result' } });
+	r.emit({ type: 'agent.status', snapshot: { lastResponse: '', status: 'Step Code 正在思考' } });
+	assert.equal(r.controller.snapshot().lastAgentText, '');
+	r.emit({ type: 'agent.text', text: 'first chunk', snapshot: { lastResponse: 'first chunk' } });
+	r.emit({ type: 'agent.text', text: 'first chunk, second', snapshot: { lastResponse: 'first chunk, second' } });
+	assert.equal(r.controller.snapshot().lastAgentText, 'first chunk, second');
+	r.emit({ type: 'agent.text', text: '', snapshot: { lastResponse: '' } });
+	assert.equal(r.controller.snapshot().lastAgentText, '');
+	r.emit({ type: 'agent.error', text: '未观察到执行，未自动重试', snapshot: { status: '提交失败', lastResponse: '' } });
+	assert.match(r.controller.snapshot().notice.text, /未自动重试/);
+	assert.equal(r.controller.snapshot().notice.kind, 'error');
+	assert.equal(r.engines.length, 0, 'error display must not need microphone');
 	await r.controller.dispose();
 });
 
@@ -392,6 +413,7 @@ test("late stopped acknowledgements and other frames from an old voice session c
 	r.emit({ type: "response.started", responseId: "current-response", voiceSessionId: currentId });
 	r.emit({ type: "output.transcript.delta", responseId: "current-response", text: "当前回复", voiceSessionId: currentId });
 	r.emit({ type: "output.audio.delta", responseId: "current-response", audio: PCM, voiceSessionId: currentId });
+	r.emit({ type: 'input.transcript.final', source: 'user_audio', itemId: 'input', contentIndex: 0, text: '当前输入', voiceSessionId: currentId });
 	r.engines[1].hooks.onLevel(.6);
 	const before = r.controller.snapshot();
 	const clearCount = r.engines[1].clears;
@@ -416,6 +438,7 @@ test("late stopped acknowledgements and other frames from an old voice session c
 	await tick();
 	assert.equal(r.engines[1].stops, 0); assert.equal(r.engines[1].clears, clearCount);
 	assert.equal(r.engines[1].played.length, 1);
+	assert.equal(r.controller.snapshot().transcripts.at(-1).text, '当前输入');
 	// Matching stop acknowledgements must still close the current capture adapter.
 	r.emit({ type: "voice.state", state: "stopped", voiceSessionId: currentId }); await tick();
 	assert.equal(r.controller.snapshot().voice, "stopped"); assert.equal(r.engines[1].stops, 1);

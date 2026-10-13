@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createVoiceAgentBridge } from "../src/bridge.ts";
 
-function host() {
+function host(options = {}) {
 	const handlers = new Map();
 	const messages = [];
 	let idle = true;
@@ -20,11 +20,11 @@ function host() {
 		on: (name, handler) => handlers.set(name, handler),
 		sendUserMessage: (text, options) => messages.push({ text, options }),
 	};
-	const controller = createVoiceAgentBridge(pi);
+	const controller = createVoiceAgentBridge(pi, options);
 	controller.setContext(ctx);
 	return {
 		...controller,
-		ctx,
+		ctx, pi,
 		messages,
 		get aborts() { return aborts; },
 		setIdle(value) { idle = value; },
@@ -34,6 +34,58 @@ function host() {
 		},
 	};
 }
+
+test('sync dispatch failure removes request association, clears old preview and never retries', async () => {
+	const runtime = host({ taskStartTimeoutMs: 10 });
+	const events = [];
+	runtime.agent.subscribe(event => events.push(event));
+	await runtime.emit('message_end', { message: assistant('old response') });
+	let attempts = 0;
+	runtime.pi.sendUserMessage = () => { attempts++; throw new Error('dispatch failed'); };
+	assert.throws(() => runtime.agent.submit('new task'), /dispatch failed/);
+	assert.equal(runtime.agent.snapshot().lastResponse, '');
+	assert.equal(events.at(-1).type, 'agent.error');
+	await runtime.emit('agent_start');
+	await runtime.emit('agent_settled');
+	assert.deepEqual(events.at(-1).requestIds, []);
+	assert.equal(events.at(-1).requestId, undefined);
+	await new Promise(resolve => setTimeout(resolve, 25));
+	assert.equal(attempts, 1);
+	runtime.dispose();
+});
+
+test('void host dispatch with no start times out visibly even if pending is stuck true', async () => {
+	const runtime = host({ taskStartTimeoutMs: 10 });
+	const events = [];
+	runtime.agent.subscribe(event => events.push(event));
+	runtime.setPending(true);
+	const result = runtime.agent.submit('not acknowledged');
+	await new Promise(resolve => setTimeout(resolve, 35));
+	const error = events.find(event => event.type === 'agent.error');
+	assert.equal(error.requestId, result.requestId);
+	assert.match(error.text, /尚未开始执行.*结果不确定.*未自动重试/);
+	assert.equal(runtime.messages.length, 1);
+	await runtime.emit('agent_start'); await runtime.emit('agent_settled');
+	assert.deepEqual(events.at(-1).requestIds, []);
+	runtime.dispose();
+});
+
+test('queued requests wait on busy/approval and an actual host start clears the timeout', async () => {
+	const runtime = host({ taskStartTimeoutMs: 10 });
+	const events = [];
+	runtime.agent.subscribe(event => events.push(event));
+	runtime.setIdle(false);
+	assert.equal(runtime.agent.submit('follow up').queued, true);
+	await new Promise(resolve => setTimeout(resolve, 25));
+	assert.equal(events.some(event => event.type === 'agent.error'), false);
+	await runtime.emit('agent_start');
+	runtime.setIdle(true);
+	await new Promise(resolve => setTimeout(resolve, 25));
+	assert.equal(events.some(event => event.type === 'agent.error'), false);
+	await runtime.emit('agent_settled');
+	assert.equal(events.at(-1).requestIds.length, 1);
+	runtime.dispose();
+});
 
 function assistant(text, extra = {}) {
 	return { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", ...extra };
@@ -45,8 +97,8 @@ test("voice delegates to the existing host agent without expanding slash command
 	assert.match(result.requestId, /^[\da-f-]{36}$/);
 	assert.equal(result.queued, false);
 	assert.deepEqual(runtime.messages, [{
-		text: "/dangerous user text",
-		options: { deliverAs: "steer", expandPromptTemplates: false },
+		text: "  /dangerous user text  ",
+		options: { deliverAs: "followUp", expandPromptTemplates: false },
 	}]);
 	assert.deepEqual(runtime.agent.snapshot(), {
 		sessionId: "test-session",
@@ -65,7 +117,7 @@ test("steering and follow-up requests use the host queue during a running task",
 	const runtime = host();
 	runtime.setIdle(false);
 	runtime.setPending(true);
-	assert.equal(runtime.agent.submit("Focus on tests").queued, true);
+	assert.equal(runtime.agent.submit("Focus on tests", "steer").queued, true);
 	assert.equal(runtime.agent.submit("Then explain", "followUp").queued, true);
 	assert.equal(runtime.messages[0].options.deliverAs, "steer");
 	assert.equal(runtime.messages[1].options.deliverAs, "followUp");

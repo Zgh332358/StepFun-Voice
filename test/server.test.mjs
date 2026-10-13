@@ -7,6 +7,82 @@ import { WebSocket } from 'ws';
 import { startVoiceServer, speechSummary } from '../src/server.mjs';
 
 const fakeKey = 'sk-test-step-voice-no-real-provider';
+const final = (itemId, text = '检查项目结构', contentIndex = 0) => ({ type: 'input.transcript.final', source: 'user_audio', itemId, contentIndex, text });
+
+test('bad finals and transcription failures never execute, and failed early inputs release the queue', async (t) => {
+  const { client, providers, agent } = await fixture(t);
+  const peer = await client(); peer.send({ type: 'voice.start' });
+  await peer.wait(event => event.type === 'voice.state' && event.state === 'ready');
+  const emit = providers[0].hooks.onEvent;
+  emit({ type: 'speech.start', itemId: 'failed' });
+  emit(final('good'));
+  emit({ type: 'input.transcript.failed', itemId: 'failed', contentIndex: 0, message: 'provider failure' });
+  emit(final('empty', '  '));
+  emit(final('long', 'x'.repeat(12001)));
+  emit({ ...final('index'), contentIndex: undefined });
+  emit({ ...final('source'), source: 'typed_text' });
+  emit({ ...final('partial'), type: 'input.transcript.delta' });
+  emit(final('failed', 'late corrected final'));
+  assert.equal(agent.calls.length, 1);
+  assert.equal(agent.calls[0].text, '检查项目结构');
+  await peer.wait(event => event.code === 'transcription_error');
+  emit(final(undefined));
+  await peer.wait(event => event.type === 'voice.state' && event.state === 'error');
+  assert.equal(providers[0].closed, true);
+  assert.equal(agent.calls.length, 1);
+});
+
+test('a throwing host submission is visible and is never replayed', async (t) => {
+  const { client, providers, agent } = await fixture(t);
+  let attempts = 0;
+  agent.submit = () => { attempts++; throw new Error('host dispatch failed'); };
+  const peer = await client(); peer.send({ type: 'voice.start' });
+  await peer.wait(event => event.type === 'voice.state' && event.state === 'ready');
+  providers[0].hooks.onEvent(final('one'));
+  providers[0].hooks.onEvent(final('one'));
+  const error = await peer.wait(event => event.code === 'transcription_error');
+  assert.match(error.message, /结果不确定.*未自动重试/);
+  assert.equal(attempts, 1);
+});
+
+test('old provider callbacks cannot submit after restart, even with a reused item ID', async (t) => {
+  const { client, providers, agent } = await fixture(t);
+  const peer = await client(); peer.send({ type: 'voice.start', voiceSessionId: 'one' });
+  await peer.wait(event => event.state === 'ready' && event.voiceSessionId === 'one');
+  providers[0].hooks.onEvent({ type: 'speech.start', itemId: 'same' });
+  peer.send({ type: 'voice.start', voiceSessionId: 'two' });
+  await peer.wait(event => event.state === 'ready' && event.voiceSessionId === 'two');
+  providers[0].hooks.onEvent(final('same', 'old'));
+  providers[1].hooks.onEvent(final('same', 'new'));
+  assert.deepEqual(agent.calls.map(call => call.text), ['new']);
+});
+
+test('pending and deduplication bounds stop the session rather than evicting replay protection', async (t) => {
+  const { client, providers, agent } = await fixture(t, { maxTranscriptionItems: 2, maxPendingTranscriptions: 2 });
+  const peer = await client(); peer.send({ type: 'voice.start' });
+  await peer.wait(event => event.state === 'ready');
+  providers[0].hooks.onEvent({ type: 'speech.start', itemId: 'one' });
+  providers[0].hooks.onEvent({ type: 'speech.start', itemId: 'two' });
+  providers[0].hooks.onEvent(final('three'));
+  const error = await peer.wait(event => event.code === 'transcription_error');
+  assert.match(error.message, /积压或会话过长/);
+  providers[0].hooks.onEvent(final('one'));
+  assert.equal(agent.calls.length, 0);
+  assert.equal(providers[0].closed, true);
+});
+
+test('typed input shares direct submission, defaults followUp and retains explicit steer', async (t) => {
+  const { client, providers, agent } = await fixture(t);
+  const peer = await client();
+  peer.send({ type: 'input.text', text: 'typed first' });
+  peer.send({ type: 'agent.submit', text: 'typed second', delivery: 'steer' });
+  await peer.wait(event => event.type === 'task.accepted' && event.instruction === 'typed second');
+  assert.deepEqual(agent.calls.map(({ text, delivery }) => ({ text, delivery })), [
+    { text: 'typed first', delivery: 'followUp' }, { text: 'typed second', delivery: 'steer' },
+  ]);
+  assert.equal(peer.messages.filter(event => event.type === 'task.accepted').every(event => event.source === 'typed_text'), true);
+  assert.equal(providers.length, 0, 'typing never needs microphone or Realtime');
+});
 const pause = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function fakeAgent() {
@@ -16,6 +92,7 @@ function fakeAgent() {
   const snapshot = { sessionId: 'test-session', cwd: '/test-project', busy: false, pending: false, waitingForApproval: false, status: 'ready', lastResponse: '' };
   return {
     calls, listeners, snapshot: () => ({ ...snapshot }),
+    setBusy(value) { snapshot.busy = value; snapshot.pending = value; },
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     submit(text, delivery) { const result = { requestId: `request-${calls.length + 1}`, queued: snapshot.busy }; calls.push({ text, delivery, ...result }); return result; },
     cancel() { canceled++; },
@@ -40,7 +117,9 @@ async function fixture(t, options = {}) {
     providers.push(provider);
     return provider;
   };
-  const handle = await startVoiceServer({ cwd: '/test-project', agent, env: { STEP_API_KEY: fakeKey }, providerFactory, ...options });
+  const home = mkdtemp(joinPath(tmp(), 'step-voice-server-'));
+  const env = { STEP_VOICE_HOME: home, ...(options.env ?? { STEP_API_KEY: fakeKey }) };
+  const handle = await startVoiceServer({ cwd: '/test-project', agent, providerFactory, ...options, env });
   t.after(() => handle.close());
   const url = new URL(handle.url);
   const clients = [];
@@ -121,9 +200,9 @@ test('voice events carry session identity and a delayed old stop cannot stop the
   peer.send({ type: 'voice.start', voiceSessionId: 'second' });
   await peer.wait(event => event.type === 'voice.state' && event.state === 'ready' && event.voiceSessionId === 'second');
   peer.send({ type: 'voice.stop', voiceSessionId: 'first' });
-  providers[1].hooks.onEvent({ type: 'output.audio.delta', audio: 'AAA=', responseId: 'second-response' });
-  const audio = await peer.wait(event => event.type === 'output.audio.delta');
-  assert.equal(audio.voiceSessionId, 'second');
+  providers[1].hooks.onEvent(final('second-input'));
+  const transcript = await peer.wait(event => event.type === 'input.transcript.final');
+  assert.equal(transcript.voiceSessionId, 'second');
   await pause();
   assert.equal(providers[1].closed, false);
   assert.equal(peer.messages.some(event => event.type === 'voice.state' && event.state === 'stopped' && event.voiceSessionId === 'second'), false);
@@ -182,73 +261,123 @@ test('PCM input validates frames and voice interruption leaves the coding task r
   peer.send({ type: 'voice.interrupt' });
   await peer.wait((event) => event.type === 'audio.clear');
   assert.equal(agent.canceled, 0);
-  assert.ok(providers[0].calls.some(([type]) => type === 'cancel'));
+  assert.equal(providers[0].calls.some(([type]) => type === 'cancel'), false);
   peer.send({ type: 'agent.cancel' });
   await pause();
   assert.equal(agent.canceled, 1);
 });
 
-test('native voice tools submit to the host, retain delivery and report cancellation honestly', async (t) => {
+test('native final submits raw text once without a tool; unexpected tools cannot run', async (t) => {
   const { client, providers, agent } = await fixture(t);
   const peer = await client(); peer.send({ type: 'voice.start' });
   await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
   const hooks = providers[0].hooks;
-  const result = await hooks.onToolCall({ name: 'stepcode_task', arguments: { instruction: '检查项目结构', delivery: 'followUp' } });
-  assert.equal(result.status, 'submitted');
-  assert.deepEqual(agent.calls[0], { text: '检查项目结构', delivery: 'followUp', requestId: 'request-1', queued: false });
-  assert.equal((await hooks.onToolCall({ name: 'stepcode_status' })).sessionId, 'test-session');
-  assert.equal((await hooks.onToolCall({ name: 'stepcode_cancel' })).status, 'cancellation_requested');
-  assert.equal(agent.canceled, 1);
-});
-
-test('settled queued instructions create one TTS result and clear every correlation', async (t) => {
-  const ttsCalls = [];
-  const { client, providers, agent } = await fixture(t, {
-    synthesizeSpeech: async (_, text, options) => { ttsCalls.push(text); options.onAudio(Buffer.from([0, 0, 1, 0]), { sampleRate: 24000 }); },
-  });
-  const peer = await client(); peer.send({ type: 'voice.start' });
-  await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
-  await providers[0].hooks.onToolCall({ name: 'stepcode_task', arguments: { instruction: 'first' } });
-  await providers[0].hooks.onToolCall({ name: 'stepcode_task', arguments: { instruction: 'second' } });
-  agent.emit({ type: 'agent.complete', requestId: 'request-2', requestIds: ['request-1', 'request-2'], text: '任务完成。' });
-  await peer.wait((event) => event.type === 'output.audio.done');
-  agent.emit({ type: 'agent.complete', requestId: 'request-1', text: '重复结果' });
-  await pause();
-  assert.deepEqual(ttsCalls, ['任务完成。']);
-  assert.equal(providers[0].calls.filter(([type]) => type === 'context').length, 1);
-});
-
-test('speech onset aborts task TTS and discards late chunks without canceling the task', async (t) => {
-  let ttsOptions;
-  const { client, providers, agent } = await fixture(t, {
-    synthesizeSpeech: async (_, text, options) => { ttsOptions = options; await new Promise((resolve) => options.signal.addEventListener('abort', resolve, { once: true })); },
-  });
-  const peer = await client(); peer.send({ type: 'voice.start' });
-  await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
-  await providers[0].hooks.onToolCall({ name: 'stepcode_task', arguments: { instruction: 'task' } });
-  agent.emit({ type: 'agent.complete', requestId: 'request-1', text: '完成了。' });
-  await peer.wait((event) => event.source === 'tts');
-  providers[0].hooks.onEvent({ type: 'speech.start' });
-  assert.equal(ttsOptions.signal.aborted, true);
-  ttsOptions.onAudio(Buffer.from([0, 0]), { sampleRate: 24000 });
-  await pause();
-  assert.equal(peer.messages.filter((event) => event.type === 'output.audio.delta').length, 0);
+  assert.equal(hooks.delegate, false);
+  assert.equal(hooks.autoBargeIn, false);
+  const input = final('input-1', '  检查项目结构  ');
+  hooks.onEvent(input); hooks.onEvent(input);
+  const accepted = await peer.wait(event => event.type === 'task.accepted');
+  assert.equal(accepted.source, 'user_audio');
+  assert.deepEqual(agent.calls[0], { text: input.text, delivery: 'followUp', requestId: 'request-1', queued: false });
+  for (const name of ['stepcode_task', 'stepcode_status', 'stepcode_cancel']) {
+    assert.deepEqual(await hooks.onToolCall({ name, arguments: { instruction: '不要执行' } }), { error: 'voice_delegation_disabled' });
+  }
+  assert.equal(agent.calls.length, 1);
   assert.equal(agent.canceled, 0);
 });
 
-test('host errors and task speech redact keys and preserve failure context', async (t) => {
-  let spoken;
-  const { client, providers, agent } = await fixture(t, { synthesizeSpeech: async (_, text) => { spoken = text; } });
+test('real host output is forwarded; model voice replies relay without TTS or tool execution', async (t) => {
+  const ttsCalls = [];
+  const { client, providers, agent } = await fixture(t, { env: { STEP_API_KEY: fakeKey, STEP_VOICE_SPEAK_TASKS: '0' }, synthesizeSpeech: async (...args) => ttsCalls.push(args) });
+  const peer = await client(); peer.send({ type: 'voice.start' });
+  const ready = await peer.wait(event => event.type === 'server.ready');
+  assert.equal(ready.settings.speakTasks, false, 'STEP_VOICE_SPEAK_TASKS=0 disables the readout');
+  await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
+  providers[0].hooks.onEvent(final('first'));
+  for (const type of ['response.started', 'response.done', 'tool.call']) {
+    providers[0].hooks.onEvent({ type, text: '模型代答', audio: 'AAA=' });
+  }
+  providers[0].hooks.onEvent({ type: 'output.audio.delta', responseId: 'r1', audio: 'AAA=', sampleRate: 24000 });
+  providers[0].hooks.onEvent({ type: 'output.transcript.final', responseId: 'r1', text: '模型语音说明' });
+  agent.emit({ type: 'agent.text', text: '真实公开输出' });
+  agent.emit({ type: 'agent.complete', requestId: 'request-1', requestIds: ['request-1'], text: '任务完成。' });
+  await peer.wait((event) => event.type === 'agent.complete');
+  assert.equal(peer.messages.find(event => event.type === 'agent.text').text, '真实公开输出');
+  assert.deepEqual(peer.messages.filter(event => event.type === 'output.audio.delta').map(event => event.audio), ['AAA=']);
+  assert.equal(peer.messages.find(event => event.type === 'output.transcript.final').text, '模型语音说明');
+  assert.deepEqual(ttsCalls, []);
+  assert.equal(providers[0].calls.length, 0);
+  assert.equal(peer.messages.some(event => /^(response|tool)\./.test(event.type)), false);
+});
+
+test('speakTasks summarizes the host result, adapts speech speed and falls back on failure', async (t) => {
+  const tts = [];
+  const summarizeCalls = [];
+  const { client, providers, agent } = await fixture(t, {
+    synthesizeSpeech: async (config, text, { onAudio, speed } = {}) => {
+      tts.push({ text, speed });
+      onAudio(Buffer.from([0, 0, 0, 64, 0, 128]));
+      return { audio: Buffer.alloc(6), format: 'pcm16', sampleRate: 24000 };
+    },
+    summarize: async (config, text) => {
+      summarizeCalls.push(text);
+      if (summarizeCalls.length === 3) throw new Error('summary service down');
+      return text.length > 80 ? '长'.repeat(160) : '摘要完成';
+    },
+  });
   const peer = await client(); peer.send({ type: 'voice.start' });
   await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
-  await providers[0].hooks.onToolCall({ name: 'stepcode_task', arguments: { instruction: 'task' } });
+  providers[0].hooks.onEvent(final('first'));
+  agent.emit({ type: 'agent.complete', requestId: 'request-1', requestIds: ['request-1'], text: '任务已完成，共修改两个文件。' });
+  const frame = await peer.wait((event) => event.type === 'output.audio.delta' && String(event.responseId || '').startsWith('tts-'));
+  assert.equal(frame.sampleRate, 24000);
+  assert.equal(frame.audio, Buffer.from([0, 0, 0, 64, 0, 128]).toString('base64'));
+  assert.deepEqual(tts[0], { text: '摘要完成', speed: 1 });
+  agent.emit({ type: 'agent.complete', requestId: 'request-2', requestIds: ['request-2'], text: 'x'.repeat(1000) });
+  await peer.wait((event) => event.type === 'output.audio.delta' && String(event.responseId || '').startsWith('tts-') && tts.length === 2);
+  assert.equal(tts[1].text, '长'.repeat(160));
+  assert.equal(tts[1].speed, 2, '超标准长度的摘要自动加速');
+  agent.emit({ type: 'agent.complete', requestId: 'request-3', requestIds: ['request-3'], text: 'y'.repeat(1000) });
+  await peer.wait((event) => event.type === 'output.audio.delta' && String(event.responseId || '').startsWith('tts-') && tts.length === 3);
+  assert.equal(tts[2].text, '……' + 'y'.repeat(100));
+  assert.equal(tts[2].speed, 1.275, '回退尾 102 字自适应提速回标准时长');
+  assert.equal(peer.messages.find(event => event.type === 'notice').message.includes('自动总结不可用'), true);
+  agent.emit({ type: 'agent.complete', requestId: 'request-4', isError: true, text: '失败详情' });
+  assert.equal(tts.length, 3, 'isError 完成不触发朗读');
+});
+
+test('speech order wins over final arrival order and identical separate inputs both submit', async (t) => {
+  const { client, providers, agent } = await fixture(t);
+  const peer = await client(); peer.send({ type: 'voice.start' });
+  await peer.wait(event => event.type === 'voice.state' && event.state === 'ready');
+  const emit = providers[0].hooks.onEvent;
+  for (const itemId of ['first', 'second']) {
+    emit({ type: 'speech.start', itemId });
+    emit({ type: 'speech.end', itemId });
+    emit({ type: 'input.committed', itemId });
+  }
+  emit(final('second', '重复一句'));
+  assert.equal(agent.calls.length, 0);
+  emit(final('first', '重复一句'));
+  emit(final('first', '重复一句'));
+  await peer.wait(event => event.type === 'task.accepted' && event.itemId === 'second');
+  assert.deepEqual(agent.calls.map(call => call.text), ['重复一句', '重复一句']);
+  assert.deepEqual(peer.messages.filter(event => event.type === 'task.accepted').map(event => event.itemId), ['first', 'second']);
+  assert.equal(providers[0].calls.length, 0, 'never cancel provider responses (ASR may still be pending)');
+});
+
+test('host errors redact keys and remain visible without sending result context upstream', async (t) => {
+  const { client, providers, agent } = await fixture(t);
+  const peer = await client(); peer.send({ type: 'voice.start' });
+  await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
+  providers[0].hooks.onEvent(final('first'));
   agent.emit({ type: 'agent.error', text: `error ${fakeKey} Bearer another-secret` });
   agent.emit({ type: 'agent.complete', requestId: 'request-1', isError: true, text: `请求失败 ${fakeKey}` });
-  await peer.wait((event) => event.type === 'output.audio.done');
+  await peer.wait((event) => event.type === 'agent.complete');
   assert.ok(!JSON.stringify(peer.messages).includes(fakeKey));
   assert.ok(!JSON.stringify(peer.messages).includes('another-secret'));
-  assert.match(spoken, /已隐藏/);
-  assert.ok(providers[0].calls.some(([type, text]) => type === 'context' && text.includes('任务未成功完成或已停止')));
+  assert.match(peer.messages.find(event => event.type === 'agent.error').text, /已隐藏/);
+  assert.equal(providers[0].calls.length, 0);
 });
 
 test('stop invalidates queued starts and disconnect prevents orphan upstream connections', async (t) => {
@@ -280,13 +409,20 @@ test('provider factory failure resets state so another start is possible', async
   assert.equal(attempts, 2);
 });
 
-test('a task that never starts reports the terminal login or permission boundary', async (t) => {
-  const { client, providers } = await fixture(t, { taskStartTimeoutMs: 10 });
+test('missing final after speech end reports an error and releases later input without retry', async (t) => {
+  const { client, providers, agent } = await fixture(t, { transcriptionTimeoutMs: 25 });
   const peer = await client(); peer.send({ type: 'voice.start' });
   await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
-  await providers[0].hooks.onToolCall({ name: 'stepcode_task', arguments: { instruction: 'task' } });
-  const event = await peer.wait((event) => event.code === 'agent_not_started');
-  assert.match(event.message, /终端/);
+  const emit = providers[0].hooks.onEvent;
+  emit({ type: 'speech.start', itemId: 'missing' });
+  emit({ type: 'speech.end', itemId: 'missing' });
+  emit(final('later', '后续任务'));
+  assert.equal(agent.calls.length, 0);
+  const event = await peer.wait((event) => event.code === 'transcription_error');
+  assert.match(event.message, /超时.*未提交/);
+  await peer.wait(event => event.type === 'task.accepted');
+  emit(final('missing', '不应迟到后执行'));
+  assert.deepEqual(agent.calls.map(call => call.text), ['后续任务']);
 });
 
 test('a second panel cannot take over an active voice session', async (t) => {
@@ -301,7 +437,7 @@ test('a second panel cannot take over an active voice session', async (t) => {
 test('listen failure releases the host subscription', async (t) => {
   const { url } = await fixture(t);
   const agent = fakeAgent();
-  await assert.rejects(startVoiceServer({ agent, env: {}, port: Number(url.port) }), /EADDRINUSE/);
+  await assert.rejects(startVoiceServer({ agent, env: { STEP_VOICE_HOME: mkdtemp(joinPath(tmp(), 'step-voice-listen-')) }, port: Number(url.port) }), /EADDRINUSE/);
   assert.equal(agent.listeners.size, 0);
 });
 

@@ -99,6 +99,9 @@ export interface NormalizedVoiceEvent {
 	text?: string;
 	message?: string;
 	itemId?: string;
+	contentIndex?: number;
+	requestId?: string;
+	instruction?: string;
 	responseId?: string;
 	source?: string;
 	audio?: string;
@@ -152,6 +155,7 @@ export class TerminalVoiceController {
 	private sequence = 0;
 	private outputKey?: string;
 	private fence = new ResponseFence();
+	private ducked = false;
 	private credentialsWaiter?: (result: CredentialsResult) => void;
 	private state: TerminalVoiceSnapshot = {
 		connection: "disconnected", voice: "stopped", startupPhase: "idle", muted: false, micLevel: 0, speaking: false,
@@ -202,8 +206,16 @@ export class TerminalVoiceController {
 	private clearPlayback(interrupted = false): void {
 		if (interrupted) this.fence.interrupt();
 		this.state.speaking = false;
+		this.applyEchoDuck(false);
 		for (const entry of this.state.transcripts) entry.final = true;
 		this.audio?.clear();
+	}
+	/** Without system echo cancellation, speaker playback would be re-captured as user speech; duck the mic while playing. */
+	private applyEchoDuck(playing: boolean): void {
+		const shouldDuck = playing && process.env.STEP_VOICE_ECHO_CANCEL !== "1";
+		if (shouldDuck === this.ducked) return;
+		this.ducked = shouldDuck;
+		try { this.audio?.setMuted(shouldDuck || this.state.muted); } catch { /* Best effort: the onAudio gate still blocks re-entry. */ }
 	}
 	private createStartupGate(generation: number): StartupGate {
 		let resolveCancellation: (reason: StartupCancellation) => void = () => {};
@@ -295,12 +307,12 @@ export class TerminalVoiceController {
 	private async createAudio(generation: number): Promise<NativeAudioAdapter> {
 		const callbacks: NativeAudioCallbacks = {
 			onAudio: (audio) => {
-				if (generation === this.audioGeneration && !this.disposed && this.state.voice === "ready" && !this.state.muted) {
+				if (generation === this.audioGeneration && !this.disposed && this.state.voice === "ready" && !this.state.muted && !this.ducked) {
 					try { this.send({ type: "audio.append", audio }); } catch (error) { this.notice(errorText(error), "error"); }
 				}
 			},
 			onLevel: (level) => { if (generation !== this.audioGeneration) return; this.state.micLevel = this.state.muted || this.state.voice !== "ready" ? 0 : Math.max(0, Math.min(1, level)); this.emit(); },
-			onPlayback: (playing) => { if (generation !== this.audioGeneration) return; this.state.speaking = playing && this.state.voice === "ready"; this.emit(); },
+			onPlayback: (playing) => { if (generation !== this.audioGeneration) return; this.state.speaking = playing && this.state.voice === "ready"; this.applyEchoDuck(playing); this.emit(); },
 			onError: (error) => {
 				this.failAudioSession(generation, `本机音频出错：${errorText(error)}`);
 			},
@@ -331,7 +343,7 @@ export class TerminalVoiceController {
 		const voiceSessionId = `${generation}-${randomUUID()}`;
 		this.voiceSessionId = voiceSessionId;
 		const gate = this.createStartupGate(generation);
-		this.state.voice = "connecting"; this.state.startupPhase = "preparing-audio"; this.state.muted = false; this.state.notice = undefined;
+		this.state.voice = "connecting"; this.state.startupPhase = "preparing-audio"; this.state.muted = false; this.state.notice = undefined; this.ducked = false;
 		this.fence.reset(); this.outputKey = undefined; this.emit();
 		try {
 			const creatingAudio = this.createAudio(generation);
@@ -372,7 +384,7 @@ export class TerminalVoiceController {
 	setMuted(value: boolean): void {
 		if (this.state.voice !== "ready" && this.state.voice !== "connecting") return;
 		this.state.muted = Boolean(value); this.state.micLevel = 0;
-		this.audio?.setMuted(this.state.muted); this.emit();
+		this.audio?.setMuted(this.state.muted || this.ducked); this.emit();
 	}
 	mute(value = !this.state.muted): void { this.setMuted(value); }
 	interrupt(): void {
@@ -388,7 +400,7 @@ export class TerminalVoiceController {
 		clearTimeout(this.modelReadyTimer); this.modelReadyTimer = undefined;
 		const audio = this.audio; this.audio = undefined;
 		this.state.voice = finalState; this.state.startupPhase = finalState === "error" ? "error" : audio ? "stopping" : "idle";
-		this.state.muted = false; this.state.micLevel = 0; this.state.speaking = false;
+		this.state.muted = false; this.state.micLevel = 0; this.state.speaking = false; this.ducked = false;
 		for (const entry of this.state.transcripts) entry.final = true;
 		this.fence.reset(); this.emit();
 		const problems: string[] = [];
@@ -414,17 +426,13 @@ export class TerminalVoiceController {
 		if (!value || value.length > MAX_TEXT) throw new Error("请输入 1–12000 字的内容。");
 		return value;
 	}
-	sendText(text: string): void {
-		if (this.state.voice !== "ready") throw new Error("请先开始语音通话，再发送对话文字。");
-		const value = this.textValue(text); this.clearPlayback(true);
-		this.send({ type: "input.text", text: value }); this.emit();
-	}
-	submitTask(text: string, delivery: VoiceDelivery = "steer"): void {
+	sendText(text: string): void { this.submitTask(text); }
+	submitTask(text: string, delivery: VoiceDelivery = "followUp"): void {
 		if (!this.state.agentConnected) throw new Error("后台编码任务未连接，请从 Step Code 当前会话运行 /voice。");
 		if (delivery !== "steer" && delivery !== "followUp") throw new Error("任务发送方式无效。");
 		const value = this.textValue(text);
 		this.send({ type: "agent.submit", text: value, delivery });
-		this.transcript("user", value); this.addActivity(delivery === "followUp" ? "正在排入后续任务" : "正在提交任务"); this.emit();
+		this.addActivity(delivery === "followUp" ? "正在排入后续任务" : "正在提交补充指令"); this.emit();
 	}
 	cancelTask(): void {
 		if (!this.state.agentConnected) throw new Error("后台编码任务未连接。");
@@ -467,6 +475,10 @@ export class TerminalVoiceController {
 
 	private handleEvent(event: NormalizedEvent): void {
 		if (!event || typeof event.type !== "string" || this.disposed) return;
+		// Host agent events are the output authority. Realtime voice replies play
+		// locally (option B); their text is display-only and tools stay disabled.
+		if (event.type.startsWith("response.") || event.type.startsWith("tool.")) return;
+		if (event.type.startsWith("output.") && !/^output\.(audio|transcript)\./.test(event.type)) return;
 		// A stopped provider may deliver frames after a rapid restart. Legacy unscoped frames remain compatible.
 		if (event.voiceSessionId !== undefined && event.voiceSessionId !== this.voiceSessionId) return;
 		switch (event.type) {
@@ -503,38 +515,48 @@ export class TerminalVoiceController {
 			case "speech.start": this.clearPlayback(true); break;
 			case "speech.end": this.state.micLevel = 0; break;
 			case "audio.clear": this.clearPlayback(true); break;
-			case "response.started": if (this.fence.start(event.responseId)) this.outputKey = undefined; break;
-			case "input.transcript.final": this.transcript("user", event.text || "", event.itemId); break;
-			case "output.transcript.delta":
-				if (!this.fence.accept(event.responseId)) break;
-				this.outputKey = event.itemId || event.responseId || this.outputKey || `assistant-${++this.sequence}`;
-				this.transcript("assistant", event.text || "", this.outputKey, true, false, event.source); break;
-			case "output.transcript.final":
-				if (!this.fence.accept(event.responseId)) break;
-				this.outputKey = event.itemId || event.responseId || this.outputKey || `assistant-${++this.sequence}`;
-				this.transcript("assistant", event.text || "", this.outputKey, false, true, event.source); break;
-			case "output.audio.delta":
-				if (this.state.voice !== "ready" || !this.audio || !this.fence.accept(event.responseId)) break;
-				if (event.responseId && event.responseId !== this.fence.activeId) this.fence.start(event.responseId);
-				if (typeof event.audio !== "string" || !event.audio || !/^[A-Za-z0-9+/]+={0,2}$/.test(event.audio) || event.audio.length % 4 || Buffer.from(event.audio, "base64").length % 2) throw new Error("语音模型返回了无效的 PCM16 音频。");
-				if (event.sampleRate !== undefined && (!Number.isFinite(event.sampleRate) || event.sampleRate < 8000 || event.sampleRate > 192000)) throw new Error("语音模型返回了无效的采样率。");
-				this.audio.play(event.audio, event.sampleRate || 24000); break;
-			case "response.done":
-				if (event.responseId && this.fence.activeId && event.responseId !== this.fence.activeId) break;
-				if (this.outputKey) { const entry = this.state.transcripts.find((item) => item.id === this.outputKey); if (entry) entry.final = true; }
-				this.outputKey = undefined;
-				if (event.status === "failed") this.state.notice = { kind: "error", text: `语音回复失败：${event.statusDetails?.error?.message || event.statusDetails?.error?.code || "请检查模型访问权限与网络后重试。"}` };
-				else if (event.status === "incomplete") this.state.notice = { kind: "warning", text: `语音回复未完整生成：${event.statusDetails?.reason || "可以继续说话或重试。"}` };
+			case "output.audio.delta": {
+				const audio = event.audio || "";
+				const padding = audio.endsWith("==") ? 2 : audio.endsWith("=") ? 1 : 0;
+				const bytes = audio.length % 4 === 0 ? (audio.length / 4) * 3 - padding : 0;
+				const playable = this.state.voice === "ready" && this.audio && Boolean(event.audio) && bytes > 0 && bytes % 2 === 0;
+				if (playable && this.fence.accept(event.responseId)) {
+					this.fence.start(event.responseId);
+					try { this.audio.play(audio, event.sampleRate ?? 24000); }
+					catch (error) { this.notice(`播放语音回复失败：${errorText(error)}`, "error"); }
+				}
 				break;
-			case "task.accepted": this.addActivity(event.queued ? "任务已排入队列" : "已交给 Step Code 后台执行"); break;
+			}
+			case "output.transcript.delta":
+				if (event.text) this.transcript("assistant", event.text, `voice-response:${event.responseId || "stream"}`, true, false, "model_audio");
+				break;
+			case "output.transcript.final":
+				if (event.text) this.transcript("assistant", event.text, `voice-response:${event.responseId || "stream"}`, false, true, "model_audio");
+				break;
+			case "input.transcript.final":
+				if (event.source === "user_audio" && event.itemId && Number.isInteger(event.contentIndex)) {
+					this.transcript("user", event.text || "", `${event.voiceSessionId || "voice"}:${event.itemId}:${event.contentIndex}`, false, true, "user_audio");
+				}
+				break;
+			case "task.accepted":
+				if (event.source === "typed_text") this.transcript("user", event.instruction || "", event.requestId, false, true, "typed_text");
+				if (!event.queued) { this.state.lastAgentText = ""; if (this.state.agent) this.state.agent.lastResponse = ""; }
+				if (this.state.notice?.kind !== "error") this.state.notice = undefined;
+				this.addActivity(event.queued ? "任务已排入队列" : "已发送给 Step Code，等待执行"); break;
 			case "agent.status": this.updateAgent(event); break;
-			case "agent.text": this.updateAgent(event); if (event.text) this.state.lastAgentText = event.text; break;
+			case "agent.text": this.updateAgent(event); if (event.text !== undefined) this.state.lastAgentText = event.text; break;
 			case "agent.tool": this.updateAgent(event); this.addActivity(`工具活动 · ${event.toolName || "工具"}`, event.isError ? "error" : "info"); break;
-			case "agent.complete": this.updateAgent(event); if (event.text) this.state.lastAgentText = event.text; this.addActivity(event.isError ? "后台任务未成功完成或已停止" : "后台任务已完成", event.isError ? "error" : "info"); break;
-			case "agent.error": this.updateAgent(event); this.addActivity(event.text || "后台任务执行出错", "error"); break;
+			case "agent.complete": this.updateAgent(event); if (event.text !== undefined) this.state.lastAgentText = event.text; this.addActivity(event.isError ? "后台任务未成功完成或已停止" : "后台任务已完成", event.isError ? "error" : "info"); break;
+			case "agent.error":
+				this.updateAgent(event);
+				this.state.notice = { kind: "error", text: event.text || "Step Code 执行出错，请查看主终端。" };
+				this.addActivity(this.state.notice.text, "error"); break;
 			case "error":
 				this.state.notice = { kind: "error", text: event.message || "语音服务发生错误。" };
 				if (this.credentialsWaiter) { this.state.setup = { phase: "invalid", message: this.state.notice.text }; this.settleCredentials({ ok: false, message: this.state.notice.text }); }
+				break;
+			case "notice":
+				this.state.notice = { kind: "warning", text: event.message || "语音服务提示。" };
 				break;
 			case "closed": void this.stop(false); this.state.notice = { kind: "info", text: "语音会话已结束，可以重新开始。" }; break;
 		}
@@ -551,7 +573,7 @@ export class TerminalVoiceController {
 	private updateAgent(event: NormalizedEvent): void {
 		if (!event.snapshot) return;
 		this.state.agent = event.snapshot;
-		if (event.snapshot.lastResponse) this.state.lastAgentText = event.snapshot.lastResponse;
+		this.state.lastAgentText = event.snapshot.lastResponse;
 	}
 	async dispose(): Promise<void> {
 		if (this.disposed) return;

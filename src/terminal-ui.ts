@@ -52,7 +52,10 @@ export function voiceWidgetLines(state: TerminalVoiceSnapshot, agent: AgentSnaps
 	const accent = state.voice === "ready" ? "success" : state.voice === "error" ? "error" : "accent";
 	const status = theme.fg(accent, `● Step Voice · ${voiceStateLabel(state)}`);
 	const lines = [status + theme.fg("dim", "  /voice · /voice mute · /voice interrupt · /voice end")];
-	if (agent.busy || agent.pending) lines.push(theme.fg("dim", `  ${clean(agent.status)} · 后台工作时语音保持在线`));
+	lines.push(theme.fg(agent.waitingForApproval ? "warning" : "dim", `  ${clean(agent.status)}${agent.busy || agent.pending ? " · 后台工作时语音保持在线" : ""}`));
+	if (agent.waitingForApproval) lines.push(theme.fg("warning", "  请在主终端处理权限确认；语音不会代为批准。"));
+	const activity = state.activity.at(-1);
+	if (activity && activity.kind !== "error") lines.push(theme.fg("dim", `  ${clean(activity.text).slice(0, 180)}`));
 	if (state.notice && ["error", "warning"].includes(state.notice.kind)) lines.push(theme.fg(state.notice.kind === "error" ? "error" : "warning", `  ${clean(state.notice.text).slice(0, 180)}`));
 	return lines;
 }
@@ -66,7 +69,7 @@ export class TerminalVoicePanel implements Component {
 	/** First-run / change-channel setup: choose the channel, then enter the Key */
 	private setup: "off" | "channel" | "key" | "done" = "off";
 	private channelIndex = 0;
-	private target: "voice" | VoiceDelivery = "voice";
+	private target: VoiceDelivery = "followUp";
 	private closed = false;
 	private released = false;
 	private pending = 0;
@@ -133,16 +136,8 @@ export class TerminalVoicePanel implements Component {
 		const text = raw.trim();
 		if (!text) return;
 		if (text.length > 12_000) { this.error = "内容过长，请拆成几段。"; return; }
-		if (this.target === "voice" && this.snapshot.voice !== "ready") {
-			// Keep the draft: the user can start the call or switch the target with Tab.
-			this.error = this.snapshot.voice === "connecting"
-				? "语音还在连接，稍后再发送；也可以按 Tab 把文字交给 Step Code。"
-				: "语音还没开始：清空输入后按 Enter 开始通话，或按 Tab 把文字交给 Step Code。";
-			return;
-		}
 		this.run(() => {
-			if (this.target === "voice") this.controller.sendText(text);
-			else this.controller.submitTask(text, this.target);
+			this.controller.submitTask(text, this.target);
 			this.input.setValue("");
 		});
 	}
@@ -219,7 +214,7 @@ export class TerminalVoicePanel implements Component {
 			if (text.trim()) this.submitText(text);
 			else this.toggleVoice();
 		} else if (matchesKey(data, "tab")) {
-			const targets = ["voice", "steer", "followUp"] as const;
+			const targets = ["followUp", "steer"] as const;
 			this.target = targets[(targets.indexOf(this.target) + 1) % targets.length];
 			this.error = "";
 		} else if (matchesKey(data, "ctrl+t")) this.run(() => this.controller.mute(), true);
@@ -241,7 +236,7 @@ export class TerminalVoicePanel implements Component {
 		const heading = (text: string): string => row(` ${this.theme.bold(this.theme.fg("accent", text))}`);
 		const lines = [
 			this.theme.fg("borderMuted", `╭${"─".repeat(inner)}╮`),
-			heading("✦ Step Voice  /  语音工作搭档"),
+			heading("✦ Step Voice  /  语音直送 Step Code"),
 		];
 		const wrapDim = (text: string): void => { for (const wrapped of wrapTextWithAnsi(text, Math.max(1, inner - 2))) lines.push(row(` ${this.theme.fg("dim", wrapped)}`)); };
 		if (this.setup !== "off") {
@@ -296,6 +291,7 @@ export class TerminalVoicePanel implements Component {
 			wrapDim("模型、音色也可用 STEP_VOICE_REALTIME_MODEL / STEP_VOICE_TTS_MODEL / STEP_VOICE_VOICE 覆盖。");
 			lines.push(separator, row(this.theme.fg("dim", ` K 更换通道或 Key${config.keySource === "saved" ? " · X 清除保存的 Key" : ""} · R 重读环境变量 · Enter / Esc 返回`)));
 		} else {
+			const compact = this.tui.terminal.rows < 32;
 			const stateColor = this.snapshot.voice === "ready" ? "success" : this.snapshot.voice === "error" ? "error" : "accent";
 			lines.push(row(` ${this.theme.fg(stateColor, "●")} ${this.theme.fg(stateColor, voiceStateLabel(this.snapshot))}${this.pending ? this.theme.fg("dim", "  ·  正在处理") : ""}`));
 			const level = this.snapshot.muted || !Number.isFinite(this.snapshot.micLevel) ? 0 : Math.min(1, Math.max(0, this.snapshot.micLevel));
@@ -303,30 +299,33 @@ export class TerminalVoicePanel implements Component {
 			const filled = Math.round(level * meterWidth);
 			const meter = "█".repeat(filled) + "░".repeat(meterWidth - filled);
 			lines.push(row(` ${this.theme.fg("dim", "麦克风")} ${this.theme.fg(stateColor, meter)} ${Math.round(level * 100)}%`));
-			lines.push(row(this.theme.fg("dim", " 自然说话、随时打断；任务在后台继续。")), separator, heading("对话"));
+			wrapDim(compact ? "停顿即直送 Step Code；忙时排队。" : "语音停顿后自动直送 Step Code；忙时排队，任务完成后朗读结果。");
+			lines.push(separator, heading("输入转写"));
 			const maxHeight = Math.max(18, Math.min(36, this.tui.terminal.rows - 4));
-			const transcriptRows = Math.max(2, maxHeight - 17);
+			const transcriptRows = compact ? 1 : Math.max(1, maxHeight - 27);
 			const transcript = this.snapshot.transcripts.flatMap((entry) => {
 				const prefix = entry.role === "user" ? "你" : "Step";
 				return wrapTextWithAnsi(`${prefix}  ${clean(entry.text)}`, Math.max(1, inner - 2));
 			});
-			for (const line of transcript.length ? transcript.slice(-transcriptRows) : ["说出想法，或直接在下方打字。", "按 Tab 可以把文字交给当前 Step Code 执行。"])
+			for (const line of transcript.length ? transcript.slice(-transcriptRows) : ["说话停顿后即提交，请一次说完一条指令。", "文字也直接发给 Step Code，无需开启麦克风。"])
 				lines.push(row(` ${this.theme.fg("text", line)}`));
 			const agent = this.agentSnapshot();
 			lines.push(separator, heading(`Step Code  ·  ${agent.waitingForApproval ? "等待你确认" : agent.busy || agent.pending ? "后台工作中" : "等待任务"}`));
 			lines.push(row(` ${clean(agent.status)}`));
-			const lastText = clean(agent.lastResponse || this.snapshot.lastAgentText);
-			for (const line of wrapTextWithAnsi(lastText || "任务公开回复会显示在这里。", Math.max(1, inner - 2)).slice(-2)) lines.push(row(` ${this.theme.fg("dim", line)}`));
+			lines.push(row(this.theme.fg("dim", " 真实输出预览 · 全文见主终端")));
+			const lastText = clean(agent.lastResponse ?? this.snapshot.lastAgentText);
+			for (const line of wrapTextWithAnsi(lastText || "等待 Step Code 的公开回复。", Math.max(1, inner - 2)).slice(compact ? -1 : -4)) lines.push(row(` ${this.theme.fg("dim", line)}`));
 			const notice = this.error || this.snapshot.notice?.text;
 			if (notice) for (const line of wrapTextWithAnsi(clean(notice), Math.max(1, inner - 2)).slice(0, 3))
 				lines.push(row(this.theme.fg(this.error || this.snapshot.notice?.kind === "error" ? "error" : "warning", ` ${line}`)));
 			lines.push(separator);
-			const label = this.target === "voice" ? "发给语音对话" : this.target === "steer" ? "交给 Step Code" : "排入后续任务";
-			lines.push(row(this.theme.fg("accent", ` ${label}`) + this.theme.fg("dim", " · Tab 切换 · Enter 发送（输入为空时开始/结束语音）")));
+			const label = this.target === "steer" ? "Step Code · 补充当前任务 (steer)" : "Step Code · 后续任务 (followUp)";
+			lines.push(row(this.theme.fg("accent", ` ${label}`)));
+			wrapDim(compact ? "Tab 文字队列 · Enter 发送/空输入启停" : "Tab 仅切换文字队列 · Enter 发送（空输入开始/结束语音）");
 			this.input.focused = this.focused;
 			lines.push(row(` ${this.input.render(Math.max(1, inner - 2))[0] ?? ""}`));
-			lines.push(row(this.theme.fg("dim", " Ctrl+T 静音 · Ctrl+X 打断 · Ctrl+G 停止任务 · Ctrl+O 设置")));
-			lines.push(row(this.theme.fg("dim", " Ctrl+Q 结束并收起 · Esc 收起（保留通话）")));
+			lines.push(row(this.theme.fg("dim", compact ? " Ctrl+T 静音 · Ctrl+G 停任务 · Esc 收起" : " Ctrl+T 静音 · Ctrl+X 清播放 · Ctrl+G 停止任务 · Ctrl+O 设置")));
+			if (!compact) lines.push(row(this.theme.fg("dim", " Ctrl+Q 结束并收起 · Esc 收起（保留通话）")));
 		}
 		lines.push(this.theme.fg("borderMuted", `╰${"─".repeat(inner)}╯`));
 		return lines.map((line) => visibleWidth(line) > width ? truncateToWidth(line, width) : line);
