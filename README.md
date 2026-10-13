@@ -1,5 +1,9 @@
 # Step Voice
 
+[![Built with step-5-preview](https://img.shields.io/badge/built%20with-step--5--preview-4C33FF)](https://platform.stepfun.com/docs/zh/api-reference/chat)
+
+> 本插件由阶跃星辰 **Step 5 Preview** 模型驱动开发（Step Code 编码代理内完成全部设计与实现）。
+
 Step Voice 是可单独加载的 Step Code 终端语音插件，让编码代理拥有 Codex 式的语音工作流：
 
 - **语音直送**：说话 → StepFun Realtime 转写 → 原文直接提交当前 Step Code（忙时 followUp 排队）。不经意图分类、不代替 Step Code 完成任务。
