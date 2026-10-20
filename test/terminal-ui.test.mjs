@@ -317,3 +317,49 @@ test("settings can reopen the setup and clear a saved Key", async () => {
 		assert.match(r.panel.render(104).join("\n"), /接入设置 · 第 1 步/);
 	} finally { r.panel.dispose(); }
 });
+
+test("an active TTS subtitle renders a readout section inside the panel budget", () => {
+	const base = runtime();
+	base.state.voice = "ready"; base.update();
+	const baseLines = base.panel.render(104).length;
+	base.panel.dispose();
+	const r = runtime();
+	try {
+		r.state.voice = "ready";
+		r.state.subtitle = { responseId: "tts-1", text: "已修改登录接口并补充了测试", charsPerSecond: 4.5, highlight: 6, active: true };
+		r.update();
+		const content = r.panel.render(104).join("\n");
+		assert.match(content, /任务播报/);
+		assert.match(content, /已修改登录接口并补充了测试/);
+		assert.ok(r.panel.render(104).length - baseLines <= 5, "subtitle costs at most separator + heading + 3 lines");
+	} finally { r.panel.dispose(); }
+});
+
+test("compact terminals keep the subtitle to a single line without its heading", () => {
+	const r = runtime({ rows: 24 });
+	try {
+		r.state.voice = "ready";
+		r.state.subtitle = { responseId: "tts-1", text: "任务已完成", charsPerSecond: 4.5, highlight: 2, active: true };
+		r.update();
+		const content = r.panel.render(104).join("\n");
+		assert.doesNotMatch(content, /任务播报/);
+		assert.match(content, /任务已完成/);
+	} finally { r.panel.dispose(); }
+});
+
+test("streaming transcripts carry a live marker and per-source prefixes", () => {
+	const r = runtime();
+	try {
+		r.state.voice = "ready";
+		r.state.transcripts = [
+			{ id: "u1", role: "user", text: "检查启动问题", final: true, source: "user_audio" },
+			{ id: "t1", role: "user", text: "帮我改一下配置", final: true, source: "typed_text" },
+			{ id: "v1", role: "assistant", text: "正在分析", final: false, source: "model_audio" },
+		];
+		r.update();
+		const content = r.panel.render(104).join("\n");
+		assert.match(content, /你  检查启动问题/);
+		assert.match(content, /你·文字  帮我改一下配置/);
+		assert.match(content, /Step·语音  正在分析 ▍/);
+	} finally { r.panel.dispose(); }
+});

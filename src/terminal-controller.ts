@@ -37,6 +37,14 @@ export interface TerminalActivity {
 	kind: "info" | "error";
 	time: number;
 }
+/** TTS readout subtitle: highlight follows the synthesized audio byte clock. */
+export interface TerminalSubtitle {
+	responseId: string;
+	text: string;
+	charsPerSecond: number;
+	highlight: number;
+	active: boolean;
+}
 export interface TerminalVoiceSnapshot {
 	connection: "disconnected" | "connecting" | "connected";
 	voice: VoiceState;
@@ -49,6 +57,7 @@ export interface TerminalVoiceSnapshot {
 	agent?: AgentSnapshot;
 	transcripts: TerminalTranscript[];
 	activity: TerminalActivity[];
+	subtitle?: TerminalSubtitle;
 	notice?: { kind: "info" | "warning" | "error"; text: string };
 	lastAgentText: string;
 	/** Progress of a Key check started from the setup view */
@@ -103,6 +112,7 @@ export interface NormalizedVoiceEvent {
 	requestId?: string;
 	instruction?: string;
 	responseId?: string;
+	charsPerSecond?: number;
 	source?: string;
 	audio?: string;
 	sampleRate?: number;
@@ -156,6 +166,9 @@ export class TerminalVoiceController {
 	private outputKey?: string;
 	private fence = new ResponseFence();
 	private ducked = false;
+	private subtitleAudioMs = 0;
+	private subtitleEnding = false;
+	private subtitleEndTimer?: ReturnType<typeof setTimeout>;
 	private credentialsWaiter?: (result: CredentialsResult) => void;
 	private state: TerminalVoiceSnapshot = {
 		connection: "disconnected", voice: "stopped", startupPhase: "idle", muted: false, micLevel: 0, speaking: false,
@@ -209,6 +222,40 @@ export class TerminalVoiceController {
 		this.applyEchoDuck(false);
 		for (const entry of this.state.transcripts) entry.final = true;
 		this.audio?.clear();
+		this.clearSubtitle();
+	}
+	/** TTS readout subtitle lifecycle. Highlight is driven purely by the synthesized
+	 *  audio byte clock (PCM16 24 kHz mono = 48 bytes per millisecond), so no timer
+	 *  is needed; finalize waits for actual playback to end, not just synthesis. */
+	private beginSubtitle(event: NormalizedEvent): void {
+		this.clearSubtitle();
+		const text = typeof event.text === "string" ? event.text : "";
+		if (!event.responseId || !text.trim()) return;
+		const charsPerSecond = Number(event.charsPerSecond) > 0 ? Number(event.charsPerSecond) : 4.5;
+		this.state.subtitle = { responseId: event.responseId, text, charsPerSecond, highlight: 0, active: true };
+		this.emit();
+	}
+	private updateSubtitleHighlight(): void {
+		const subtitle = this.state.subtitle;
+		if (!subtitle?.active) return;
+		const total = Array.from(subtitle.text).length;
+		const at = Math.min(total, Math.max(0, Math.floor((this.subtitleAudioMs / 1000) * subtitle.charsPerSecond)));
+		if (at !== subtitle.highlight) { subtitle.highlight = at; this.emit(); }
+	}
+	private finalizeSubtitle(): void {
+		clearTimeout(this.subtitleEndTimer); this.subtitleEndTimer = undefined;
+		this.subtitleEnding = false;
+		const subtitle = this.state.subtitle;
+		if (!subtitle) return;
+		subtitle.highlight = Array.from(subtitle.text).length;
+		subtitle.active = false;
+		this.emit();
+	}
+	private clearSubtitle(): void {
+		clearTimeout(this.subtitleEndTimer); this.subtitleEndTimer = undefined;
+		this.subtitleAudioMs = 0;
+		this.subtitleEnding = false;
+		if (this.state.subtitle) { this.state.subtitle = undefined; this.emit(); }
 	}
 	/** Without system echo cancellation, speaker playback would be re-captured as user speech; duck the mic while playing. */
 	private applyEchoDuck(playing: boolean): void {
@@ -312,7 +359,7 @@ export class TerminalVoiceController {
 				}
 			},
 			onLevel: (level) => { if (generation !== this.audioGeneration) return; this.state.micLevel = this.state.muted || this.state.voice !== "ready" ? 0 : Math.max(0, Math.min(1, level)); this.emit(); },
-			onPlayback: (playing) => { if (generation !== this.audioGeneration) return; this.state.speaking = playing && this.state.voice === "ready"; this.applyEchoDuck(playing); this.emit(); },
+			onPlayback: (playing) => { if (generation !== this.audioGeneration) return; this.state.speaking = playing && this.state.voice === "ready"; this.applyEchoDuck(playing); if (!playing && this.subtitleEnding) this.finalizeSubtitle(); this.emit(); },
 			onError: (error) => {
 				this.failAudioSession(generation, `本机音频出错：${errorText(error)}`);
 			},
@@ -402,7 +449,7 @@ export class TerminalVoiceController {
 		this.state.voice = finalState; this.state.startupPhase = finalState === "error" ? "error" : audio ? "stopping" : "idle";
 		this.state.muted = false; this.state.micLevel = 0; this.state.speaking = false; this.ducked = false;
 		for (const entry of this.state.transcripts) entry.final = true;
-		this.fence.reset(); this.emit();
+		this.fence.reset(); this.clearSubtitle(); this.emit();
 		const problems: string[] = [];
 		let cleanupFailed = false;
 		try { audio?.clear(); } catch (error) { problems.push(`清除播放队列失败：${errorText(error)}`); }
@@ -478,7 +525,7 @@ export class TerminalVoiceController {
 		// Host agent events are the output authority. Realtime voice replies play
 		// locally (option B); their text is display-only and tools stay disabled.
 		if (event.type.startsWith("response.") || event.type.startsWith("tool.")) return;
-		if (event.type.startsWith("output.") && !/^output\.(audio|transcript)\./.test(event.type)) return;
+		if (event.type.startsWith("output.") && !/^output\.(audio|transcript|subtitle)\./.test(event.type)) return;
 		// A stopped provider may deliver frames after a rapid restart. Legacy unscoped frames remain compatible.
 		if (event.voiceSessionId !== undefined && event.voiceSessionId !== this.voiceSessionId) return;
 		switch (event.type) {
@@ -519,6 +566,11 @@ export class TerminalVoiceController {
 				const audio = event.audio || "";
 				const padding = audio.endsWith("==") ? 2 : audio.endsWith("=") ? 1 : 0;
 				const bytes = audio.length % 4 === 0 ? (audio.length / 4) * 3 - padding : 0;
+				const subtitle = this.state.subtitle;
+				if (subtitle?.active && event.responseId === subtitle.responseId && bytes > 0) {
+					this.subtitleAudioMs += bytes / 48;
+					this.updateSubtitleHighlight();
+				}
 				const playable = this.state.voice === "ready" && this.audio && Boolean(event.audio) && bytes > 0 && bytes % 2 === 0;
 				if (playable && this.fence.accept(event.responseId)) {
 					this.fence.start(event.responseId);
@@ -533,6 +585,25 @@ export class TerminalVoiceController {
 			case "output.transcript.final":
 				if (event.text) this.transcript("assistant", event.text, `voice-response:${event.responseId || "stream"}`, false, true, "model_audio");
 				break;
+			case "output.subtitle.start":
+				// A stale session must not resurrect a subtitle after the call ended.
+				if (this.state.voice !== "ready") break;
+				this.beginSubtitle(event);
+				break;
+			case "output.subtitle.end": {
+				const subtitle = this.state.subtitle;
+				if (!subtitle || subtitle.responseId !== event.responseId) break;
+				this.subtitleEnding = true;
+				if (!this.state.speaking) this.finalizeSubtitle();
+				else {
+					// Synthesis finishing is not playback finishing: wait for the audio
+					// tail, with a timeout in case the native player stalls.
+					clearTimeout(this.subtitleEndTimer);
+					this.subtitleEndTimer = setTimeout(() => this.finalizeSubtitle(), 3000);
+					this.subtitleEndTimer.unref?.();
+				}
+				break;
+			}
 			case "input.transcript.final":
 				if (event.source === "user_audio" && event.itemId && Number.isInteger(event.contentIndex)) {
 					this.transcript("user", event.text || "", `${event.voiceSessionId || "voice"}:${event.itemId}:${event.contentIndex}`, false, true, "user_audio");
