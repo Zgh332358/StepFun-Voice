@@ -4,6 +4,8 @@
 
 > 本插件由阶跃星辰 **Step 5 Preview** 模型驱动开发（Step Code 编码代理内完成全部设计与实现）。
 
+> **这是 Windows 版**，与 macOS 版（Swift 音频助手）隔离维护、互不影响。macOS 版的 Swift 代码与 Xcode 编译流程不在此目录中。
+
 Step Voice 是可单独加载的 Step Code 终端语音插件，让编码代理拥有 Codex 式的语音工作流：
 
 - **语音直送**：说话 → StepFun Realtime 转写 → 原文直接提交当前 Step Code（忙时 followUp 排队）。不经意图分类、不代替 Step Code 完成任务。
@@ -17,8 +19,8 @@ Step Voice 是可单独加载的 Step Code 终端语音插件，让编码代理�
 
 ```mermaid
 flowchart TB
-  subgraph T["终端进程（macOS）"]
-    MIC["麦克风"] --> SW["Swift 音频助手 native/VoiceAudio.swift\n采集 PCM16 24kHz · 播放 · 电平表 · 3 秒无输入看门狗"]
+  subgraph T["终端进程（Windows）"]
+    MIC["麦克风"] --> SW["C# 音频助手 native/VoiceAudio.cs\n采集 PCM16 24kHz · 播放 · 电平表 · 3 秒无输入看门狗（WinMM waveIn/waveOut）"]
     SW -- "JSONL：audio / level / playback" --> CTRL["终端控制器 terminal-controller.ts\n状态机 · 播放 fence · 回声 duck · 事件分发"]
     CTRL --> UI["终端面板 terminal-ui.ts\n字幕 · 电平表 · 任务预览"]
   end
@@ -33,7 +35,7 @@ flowchart TB
   HOST -- "agent 事件（文本/状态/完成）" --> SERVER
 ```
 
-播报链路（任务完成后触发）：宿主输出 → LLM 总结（失败自动回退为结尾 100 字截断）→ TTS 合成（超标准时长自动提速，最高 2 倍）→ 本地播放。播放期间麦克风自动静音防止外放回声循环；`STEP_VOICE_ECHO_CANCEL=1` 时保持麦克风开启以支持语音打断。
+播报链路（任务完成后触发）：宿主输出 → LLM 总结（失败自动回退为结尾 100 字截断）→ 面板立即显示将朗读的全文字幕 → TTS 合成（超标准时长自动提速，最高 2 倍）→ 本地播放，已读字幕随播放进度高亮（音频字节时钟 × 自适应语速）。播放期间麦克风自动静音防止外放回声循环；Windows 不支持系统回声消除，`STEP_VOICE_ECHO_CANCEL=1` 时保持麦克风开启以支持语音打断（建议佩戴耳机）。
 
 ### 模块职责
 
@@ -41,11 +43,11 @@ flowchart TB
 | --- | --- |
 | `index.ts` | 插件入口：注册 `/voice` 命令与扩展生命周期 |
 | `src/terminal-ui.ts` | 终端面板：字幕、电平表、任务预览、按键处理 |
-| `src/terminal-controller.ts` | 语音控制器：状态机、音频适配器、播放 fence、回声 duck、事件分发 |
+| `src/terminal-controller.ts` | 语音控制器：状态机、音频适配器、播放 fence、回声 duck、事件分发、TTS 朗读字幕时钟 |
 | `src/server.mjs` | 本地 relay（仅 127.0.0.1）：鉴权、转写顺序/去重、TTS 朗读与总结调度 |
 | `src/stepfun.mjs` | StepFun 客户端：Realtime WS 协议、`synthesizeSpeech`、`summarizeForSpeech`、事件归一化 |
-| `src/native-audio.mjs` | 音频助手生命周期：按源码摘要本地编译 Swift 二进制、JSONL IPC |
-| `native/VoiceAudio.swift` | macOS 采集/播放/电平/看门狗（AVAudioEngine，编译时内嵌 Info.plist） |
+| `src/native-audio.mjs` | 音频助手生命周期：按源码摘要用 .NET Framework 编译器本地编译 C# 助手、JSONL IPC |
+| `native/VoiceAudio.cs` | Windows 采集/播放/电平/看门狗（WinMM waveIn/waveOut，轮询回收缓冲，无需外部依赖） |
 | `src/bridge.ts` | 宿主桥接：`sendUserMessage`、agent 事件快照 |
 | `src/transcription-queue.mjs` | 转写乱序/超时/去重队列 |
 | `src/credentials.mjs` | Key 保存与校验（目录 700 / 文件 600） |
@@ -54,18 +56,18 @@ flowchart TB
 
 ## 安装与启动
 
-当前原生音频支持 **macOS**，需要 Node.js **22.19 或更高版本**、已安装的 Step Code 和 **Xcode Command Line Tools**。从源码启动 Step Code 还需要 pnpm **9**。首次开始语音时会编译音频助手；缺少编译工具时，按系统提示运行 `xcode-select --install` 安装。
+当前原生音频支持 **Windows 10 / 11**，需要 Node.js **22.19 或更高版本**、已安装的 Step Code，以及系统自带的 **.NET Framework 4.x**（Win10/11 内置，无需单独安装）。首次开始语音时会用 `csc.exe` 编译音频助手并缓存；缺少编译器时面板会提示安装 .NET Framework 4.8。不需要 Xcode、Swift 或任何额外音频依赖。
 
-### 从 GitHub 安装
+### 安装（本地目录）
 
-GitHub 托管插件源码和版本，不需要 npm 账号。插件仓库为 [Zgh332358/StepFun-Voice](https://github.com/Zgh332358/StepFun-Voice)，根目录直接包含 `package.json`、`index.ts`、`src/` 和 `native/`。详见 [GitHub 分发说明](GITHUB.md)。
+仓库根目录直接包含 `package.json`、`index.ts`、`src/` 和 `native/`。本 Windows 版按本地目录安装。在要使用语音的项目目录执行（把路径替换为本仓库的实际位置）：
 
-在要使用语音的项目目录执行：
-
-```bash
-step install -l git:github.com/Zgh332358/StepFun-Voice
+```powershell
+step install C:\path\to\StepFun-Voice-Windows
 step
 ```
+
+`-l` 表示只安装到当前项目：`step install -l C:\path\to\StepFun-Voice-Windows`。
 
 然后输入 `/voice`。**第一次打开时面板会引导你完成接入**：
 
@@ -73,7 +75,7 @@ step
 2. 粘贴 API Key（输入时只显示最后 4 位）。两个通道用同一把平台 Key，在 [platform.stepfun.com/interface-key](https://platform.stepfun.com/interface-key) 创建；Step Plan 通道需要账号已[订阅套餐](https://platform.stepfun.com/step-plan)。
 3. 插件当场验证：先确认 Key 被该通道接受，再确认该通道的实时语音模型能建立会话。通过后保存，按 Enter 开始语音。
 
-如果启动前已经 `export STEP_API_KEY`，第 2 步直接按 Enter 就会使用它，不会另存一份。之后可在面板按 Ctrl+O → K 更换通道或 Key，或运行 `/voice setup`。Step Code 会 clone 仓库、安装运行依赖并注册扩展。安装仅注册插件，麦克风在用户明确开始语音后启用。
+如果启动前已经设置 `STEP_API_KEY`（PowerShell：`$env:STEP_API_KEY = '...'`），第 2 步直接按 Enter 就会使用它，不会另存一份。之后可在面板按 Ctrl+O → K 更换通道或 Key，或运行 `/voice setup`。Step Code 会安装运行依赖并注册扩展。安装仅注册插件，麦克风在用户明确开始语音后启用。
 
 ### 两个接入通道
 
@@ -97,22 +99,19 @@ step
 | 结果总结（文本模型） | `step-3.7-flash` | `STEP_VOICE_SUMMARY_MODEL` |
 | 语音音色 | `linjiajiejie` | `STEP_VOICE_VOICE` |
 
-要覆盖默认模型或音色，用 `export STEP_VOICE_REALTIME_MODEL=...` 等变量设置你 StepFun 账号可用的模型或音色，再从**同一个终端**运行 `step`。如果 Step Code 已经运行，先退出，再设置变量并重新启动；在另一个终端执行 `export` 不会更新已有进程。启动后用 `/voice config`，或在语音面板按 Ctrl+O，查看当前配置。
+要覆盖默认模型或音色，用 `$env:STEP_VOICE_REALTIME_MODEL = '...'` 等变量设置你 StepFun 账号可用的模型或音色，再从**同一个终端**运行 `step`。如果 Step Code 已经运行，先退出，再设置变量并重新启动；在另一个终端设置的环境变量不会更新已有进程。启动后用 `/voice config`，或在语音面板按 Ctrl+O，查看当前配置。
 
 编码与文件、终端任务沿用 **Step Code 当前选择的模型**，不由这些语音变量指定。代码还提供默认型号为 `stepaudio-3-asr-max` 的独立 ASR helper，可通过 `STEP_VOICE_ASR_MODEL` 修改；当前通话的理解和字幕由 Realtime 完成，不使用这个独立 ASR 路径。
 
 ### 管理安装
 
-不带 `-l` 时安装到用户范围，可用于其他项目。当前项目引用保存在 `.stepcode/config.toml`；用户引用保存在 `~/.stepcode/config.toml`，由 Step Code 管理。安装后重新启动 Step Code，或通过 `/reload` 重载。查看、更新和卸载：
+不带 `-l` 时安装到用户范围，可用于其他项目。当前项目引用保存在 `.stepcode\config.toml`；用户引用保存在 `%USERPROFILE%\.stepcode\config.toml`，由 Step Code 管理。安装后重新启动 Step Code，或通过 `/reload` 重载。查看和卸载（本地目录安装没有远程版本概念，不需要 update）：
 
-```bash
+```powershell
 step list
-step update --extension git:github.com/Zgh332358/StepFun-Voice
-step remove -l git:github.com/Zgh332358/StepFun-Voice
-# 用户范围卸载：step remove git:github.com/Zgh332358/StepFun-Voice
+step remove C:\path\to\StepFun-Voice-Windows
+# 项目范围卸载：step remove -l C:\path\to\StepFun-Voice-Windows
 ```
-
-`update` 按仓库匹配用户和当前项目中的已配置来源，不使用 `-l`。不固定 ref 时跟随当前跟踪分支。要固定版本，在仓库确实创建了对应 tag 后，使用 `step install -l git:github.com/Zgh332358/StepFun-Voice@v0.1.0`；升级时重新安装新的 tag。
 
 本插件没有 npm 发布配置、scope 设置或 npx 安装器；`package.json` 标记为 `private`。依赖安装仍由 Step Code 的 Node package 工具处理，这是插件运行需要的 `ws` 依赖。无需在 npm 注册或发布插件。
 
@@ -120,39 +119,38 @@ step remove -l git:github.com/Zgh332358/StepFun-Voice
 
 在仓库根目录执行：
 
-```bash
-pnpm install --frozen-lockfile
-npm --prefix plugins/step-voice ci --ignore-scripts
+```powershell
+npm install --no-audit --no-fund
 
 # 在启动 Step Code 的同一个终端设置开放平台 Key。
-export STEP_API_KEY='你的 StepFun API Key'
+$env:STEP_API_KEY = '你的 StepFun API Key'
 
-pnpm step -e ./plugins/step-voice/index.ts
+step -e .\index.ts
 ```
 
-进入 Step Code 后输入 `/voice`，终端会显示语音面板。输入框为空时按 **Enter** 开始语音，按 macOS 提示允许当前终端应用使用麦克风，即可直接说话。只打开面板不会开启麦克风。也可以输入 `/voice start` 直接开始通话。
+进入 Step Code 后输入 `/voice`，终端会显示语音面板。输入框为空时按 **Enter** 开始语音，在 Windows 首次弹出的麦克风隐私提示中允许访问，即可直接说话。只打开面板不会开启麦克风。也可以输入 `/voice start` 直接开始通话。
 
-仓库根目录还提供 `启动 Step Voice.command`。设置 Key 后，可在同一个终端运行：
+仓库根目录还提供 `启动 Step Voice.cmd`。设置 Key 后，可在同一个终端运行：
 
-```bash
-"./启动 Step Voice.command"
+```powershell
+.\启动 Step Voice.cmd
 ```
 
-脚本检查 Node 和已安装依赖，然后启动带插件的 Step Code；进入后仍通过 `/voice` 使用语音。Finder 双击启动不会继承另一个终端刚设置的 `export`，环境变量接入建议使用上面的同终端启动方式。
+脚本检查 Node 和已安装依赖，然后启动带插件的 Step Code；进入后仍通过 `/voice` 使用语音。资源管理器双击启动不会继承另一个终端刚设置的 `$env:`，环境变量接入建议使用上面的同终端启动方式。
 
 ### 项目级安装
 
 插件已在 `package.json` 的 `pi.extensions` 中声明入口。也可通过 Step package 机制安装到当前项目：
 
-```bash
-# 在仓库根目录使用源码 CLI 安装。
-pnpm step install -l ./plugins/step-voice
-pnpm step
+```powershell
+# 在目标项目目录引用本仓库。
+step install -l C:\path\to\StepFun-Voice-Windows
+step
 ```
 
-使用已安装的 `step` 命令时，可在目标项目中执行 `step install -l /path/to/StepFun-Voice`，将示例路径替换为实际插件目录。`-l` 将 package 引用写入目标项目的 `.stepcode/config.toml`；重新启动 Step Code 后即可运行 `/voice`。
+`-l` 将 package 引用写入目标项目的 `.stepcode\config.toml`；重新启动 Step Code 后即可运行 `/voice`。
 
-首次体验和开发可继续使用 `-e ./index.ts`，无需保存 package 设置。`step.plugin.json` 提供插件身份信息；启用入口使用上述 extension / Step package 加载方式。
+首次体验和开发可继续使用 `-e .\index.ts`，无需保存 package 设置。`step.plugin.json` 提供插件身份信息；启用入口使用上述 extension / Step package 加载方式。
 
 ## 终端操作
 
@@ -207,7 +205,7 @@ Key 有两个来源：
 | `STEP_VOICE_VOICE` | `linjiajiejie` | 语音音色 |
 | `STEP_VOICE_SILENCE_MS` | `450` | VAD 停顿判定，范围 100–2000 毫秒 |
 | `STEP_VOICE_VAD_THRESHOLD` | `2500` | VAD 能量阈值，范围 0–5000 |
-| `STEP_VOICE_ECHO_CANCEL` | `0` | 置 `1` 启用系统回声消除；部分 macOS 上开启后麦克风无数据（见下文排查）。开启后播放期间不再自动静音麦克风，可语音打断 |
+| `STEP_VOICE_ECHO_CANCEL` | `0` | 置 `1` 时播放期间保持麦克风开启，可语音打断（默认播放时自动静音防回声循环）。Windows 不提供系统回声消除，开启后助手会提示建议佩戴耳机 |
 | `STEP_VOICE_SPEAK_TASKS` | 开 | 置 `0` 关闭任务完成后的 TTS 结果朗读 |
 | `STEP_VOICE_SUMMARY` | 开 | 置 `0` 关闭 LLM 自动总结，改用结尾 100 字截断 |
 | `STEP_VOICE_INSTRUCTIONS` | 内置语音陪伴提示 | 仅影响上游会话提示，不能开启工具委派 |
@@ -231,8 +229,11 @@ Key 有两个来源：
 
 1. 取宿主真实输出的结尾（脱敏后最多 100 字）；
 2. 调用总结模型压缩为口语化摘要（模型不可用时自动回退为该截断文本，并在面板提示一次原因）；
-3. 调用 TTS 合成，语速按摘要长度自适应：80 字内原速，超长按比例提速（上限 2 倍），整段控制在播放队列 30 秒上限内；
-4. 播放期间麦克风自动静音（防外放回声循环），播完恢复；`STEP_VOICE_ECHO_CANCEL=1` 时不静音，支持语音打断。
+3. 面板随即显示将朗读的全文字幕，已读部分随播放进度高亮：高亮按合成音频的字节时钟推进（PCM16 24 kHz 单声道 = 48 字节/毫秒），语速取本次朗读的自适应倍速；
+4. 调用 TTS 合成，语速按摘要长度自适应：80 字内原速，超长按比例提速（上限 2 倍），整段控制在播放队列 30 秒上限内；
+5. 播放期间麦克风自动静音（防外放回声循环），播完恢复；`STEP_VOICE_ECHO_CANCEL=1` 时不静音，支持语音打断。
+
+字幕在朗读开始时就完整可见，高亮位置是字级估算（起止点精确，标点停顿处可能有轻微漂移）；合成完成不等于播放完成，字幕会等音频播完才真正收尾。`voice.interrupt` / Ctrl+X 会同时终止合成、播放与字幕。
 
 `voice.interrupt` / Ctrl+X 会同时终止合成与播放。总结失败与播放队列溢出都只产生面板提示，不影响语音会话。
 
@@ -242,9 +243,13 @@ Key 有两个来源：
 
 ### 麦克风电平表恒为 0%
 
-部分 macOS 上启用系统回声消除（VPIO）后，麦克风输入回调完全停止，且同一进程内无法恢复，表现为面板“正在聆听”但电平表恒为 0%、永远没有转写。因此现在**默认使用普通采集、不启用回声消除**；默认朗读走 TTS 且播放期间麦克风已自动静音，通常无需回声消除，外放时建议戴耳机。确需系统回声消除（开启 `STEP_VOICE_ECHO_CANCEL=1` 后佩戴耳机），可语音打断播放。
+音频助手内置 3 秒无输入看门狗：采集被系统阻断时会在面板显示提示。常见原因是 Windows 隐私设置未允许桌面应用访问麦克风，或输入设备选择错误：
 
-音频助手内置 3 秒无输入看门狗：采集被系统饿死时会在面板显示提示。诊断显示采集无数据时，到 系统设置→声音→输入 重新选择一次输入设备可恢复。
+1. 打开 **设置 → 隐私和安全性 → 麦克风**，确认已允许应用访问麦克风、且“允许桌面应用访问麦克风”为开；
+2. 到 **设置 → 系统 → 声音 → 输入** 确认默认输入设备正确、有电平反应；
+3. 重新开始语音（`/voice end` 后再次 Enter）。
+
+默认播放期间麦克风自动静音（防外放回声循环），电平表归零属于正常现象，播放结束即恢复。外放环境建议佩戴耳机；`STEP_VOICE_ECHO_CANCEL=1` 可让麦克风在播放期间保持开启以支持语音打断，但 Windows 不做回声消除，外放时可能打断自己。
 
 ### 播放队列溢出
 
@@ -256,36 +261,49 @@ Key 有两个来源：
 
 ### 卡在准备或处理状态时
 
-语音面板顶部显示实际语音阶段：“准备本地音频助手”“打开麦克风”“连接 StepFun 语音模型”，连接完成后显示“正在聆听”。下方“Step Code · 等待任务”只表示编码 Agent 当前闲置。首次使用需要编译助手；看到麦克风权限提示时，在系统提示中允许当前终端应用。
+语音面板顶部显示实际语音阶段：“准备本地音频助手”“打开麦克风”“连接 StepFun 语音模型”，连接完成后显示“正在聆听”。下方“Step Code · 等待任务”只表示编码 Agent 当前闲置。首次使用需要用系统自带的 .NET Framework 编译 C# 助手并缓存（位于 `%LOCALAPPDATA%\StepVoice\native`）；缺少编译器时面板会给出安装提示。Windows 通常不会弹出麦克风授权对话框，请在 设置 → 隐私和安全性 → 麦克风 中确认已允许桌面应用访问。
 
 准备与打开音频有 75 秒总超时，模型就绪等待最多 25 秒。可以按 Enter 取消启动，再次 Enter 重试；旧操作与旧会话事件不会覆盖新通话。
 
 ### 修改源码后生效
 
-修改源码不会热更新已加载模块。先用 `/voice end` 结束录音，待宿主任务稳定后手动 `/reload`，或退出再启动 Step Code。Swift 助手按源码摘要自动重新编译。若同时有项目和全局安装，确认重载的是所修改的项目副本；不要执行更新命令覆盖本地变更。
+修改源码不会热更新已加载模块。先用 `/voice end` 结束录音，待宿主任务稳定后手动 `/reload`，或退出再启动 Step Code。C# 助手按源码摘要自动重新编译并缓存（缓存在 `%LOCALAPPDATA%\StepVoice\native`）。若同时有项目和用户范围安装，确认重载的是所修改的项目副本；本地目录安装没有远程版本，`step update` 不会覆盖你的修改。
 
 宿主的 `sendUserMessage` 返回 `void`，因此“已提交 / 已排队”只表示已尝试交给宿主，不是执行成功确认。插件在 45 秒未观察到开始、且宿主没有运行任务或等待交互时，显示无启动错误；排队时继续等待当前工作/权限结束。同步提交异常会清除本次关联，**接受结果不确定时不补发、不自动重试**。请先核对主终端的用户消息、队列、模型/登录错误，再决定是否重新输入。
 
 ## 测试
 
-```bash
-STEP_CODE_SOURCE=/path/to/Step-Code node --test \
-  test/bridge.test.mjs test/server.test.mjs test/stepfun.test.mjs \
-  test/terminal-controller.test.mjs test/terminal-ui.test.mjs
+```powershell
+npm test        # 等价于 node --test，Node 自动发现 test/ 下的用例
+
+# UI 套件需要宿主真实 TUI 模块，其余套件不需要：
+$env:STEP_CODE_SOURCE = "C:\path\to\Step-Code"
+npm test
 ```
 
-`STEP_CODE_SOURCE` 仅提供已安装依赖的宿主真实 TUI 模块，正常运行由宿主 loader 提供。测试使用模拟宿主、WebSocket、API 响应和音频适配器；server 测试只建立 localhost 服务，凭证测试使用临时目录，不读取真实凭证、不录音、不请求真实 API。覆盖最终转写直送、重放、乱序、失败与超时、旧会话隔离、宿主错误、无启动超时、文字队列、真实文本预览、模型语音回复播放与回退、TTS 朗读与总结回退、回声 duck。
+`STEP_CODE_SOURCE` 仅提供已安装依赖的宿主真实 TUI 模块，正常运行由宿主 loader 提供。测试使用模拟宿主、WebSocket、API 响应和音频适配器；server 测试只建立 localhost 服务，凭证测试使用临时目录，不读取真实凭证、不录音、不请求真实 API。覆盖最终转写直送、重放、乱序、失败与超时、旧会话隔离、宿主错误、无启动超时、文字队列、真实文本预览、模型语音回复播放与回退、TTS 朗读与总结回退、回声 duck，以及 Windows 原生层的编译器发现、IPC 生命周期与 C# 助手协议契约。
 
 mock 测试不能替代真机验收：请在授权麦克风后说一句无副作用请求（例如“请原样回复：直送测试成功”），核对一条原生转写、一次宿主提交、对应真实输出与朗读。
 
+### Windows 首次验证清单
+
+C# 音频助手需要在真实 Windows 设备上完成首次编译与运行，建议按顺序验收：
+
+1. `step` → `/voice` → Enter：面板出现“正在聆听”，说话时电平表有起伏；
+2. 说“请原样回复：直送测试成功”：只出现一条提交，宿主只执行一次；
+3. 任务完成后：面板“任务播报”先出现字幕，随后开始朗读，已读文字逐步高亮；
+4. `/voice end`：播报停止，任务管理器中没有残留的 `VoiceAudio-*.exe`；
+5. 若电平始终为 0：按上文检查麦克风隐私设置，再重新开始。
+
 ## 边界与限制
 
-- Windows / Linux 的原生音频适配尚未实现；语音功能仅限 macOS。
-- 实际延迟、中文识别、音色效果、扬声器回声表现，需要在配置 Key 的 macOS 设备上验证。VAD 由 StepFun 服务端判定，网络延迟与录音环境会影响打断速度。
+- 原生音频当前实现于 **Windows**（WinMM waveIn/waveOut，系统自带 .NET Framework 编译）；macOS 版在独立目录维护（Swift 音频助手）；Linux 未实现。
+- 实际延迟、中文识别、音色效果、扬声器回声表现，需要在配置 Key 的 Windows 设备上验证。VAD 由 StepFun 服务端判定，网络延迟与录音环境会影响打断速度。
+- Windows 不提供系统回声消除（AEC）；默认播放期间自动静音麦克风，外放场景建议佩戴耳机。
 - 总结模型 `step-3.7-flash` 为思考型模型，朗读前有几秒总结延迟；若账号无此模型，朗读自动回退为结尾截断并在面板提示。
 - 国内和海外 API 的账号、Key、模型可用性需要分别核实，插件不会自动跨地区发送 Key。服务与型号变化时，以 StepFun 当前文档为准。
 
-如果本地控制连接失败，执行 `/voice stop` 后再 `/voice`，重建控制器。麦克风被拒绝时，在 macOS 系统设置中允许当前终端应用使用麦克风，再重新开始。缺少 Key 时会显示环境变量说明；Key、模型权限和接口错误在终端呈现。
+如果本地控制连接失败，执行 `/voice stop` 后再 `/voice`，重建控制器。麦克风被拒绝时，在 Windows 设置 → 隐私和安全性 → 麦克风 中允许桌面应用访问麦克风，再重新开始。缺少 Key 时会显示环境变量说明；Key、模型权限和接口错误在终端呈现。
 
 ## 官方资料
 

@@ -40,7 +40,13 @@ export function channelFromBaseUrl(baseUrl) {
 }
 
 export function credentialsDir(env = process.env) {
-	return env.STEP_VOICE_HOME || join(env.HOME || homedir(), ".stepcode", "step-voice");
+	if (env.STEP_VOICE_HOME) return env.STEP_VOICE_HOME;
+	// Git Bash sets HOME to a POSIX path (/c/Users/...), which is not a valid
+	// Windows path for Node. Prefer the native profile directories there.
+	const home = process.platform === "win32"
+		? (env.USERPROFILE || homedir())
+		: (env.HOME || homedir());
+	return join(home, ".stepcode", "step-voice");
 }
 export function credentialsFile(env = process.env) { return join(credentialsDir(env), "credentials.json"); }
 

@@ -1,7 +1,7 @@
 {
-	"id": "step-voice",
-	"name": "Step Voice",
-	"description": "Native terminal voice with StepFun models, connected to the current Step Code agent via /voice.",
-	"version": "0.1.1",
+	"id": "step-voice-windows",
+	"name": "Step Voice (Windows)",
+	"description": "Native terminal voice with StepFun models on Windows, connected to the current Step Code agent via /voice.",
+	"version": "0.2.0-win.1",
 	"entry": "index.ts"
 }

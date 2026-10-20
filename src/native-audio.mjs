@@ -1,40 +1,64 @@
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, randomBytes } from 'node:crypto';
-import { readFile, mkdir, lstat, access, rename, unlink } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { readFile, mkdir, access, rename, unlink } from 'node:fs/promises';
+import { constants, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 
 const execFileAsync = promisify(execFile);
-const swiftSource = join(dirname(fileURLToPath(import.meta.url)), '../native/VoiceAudio.swift');
-const infoPlist = join(dirname(swiftSource), 'Info.plist');
+const csSource = join(dirname(fileURLToPath(import.meta.url)), '../native/VoiceAudio.cs');
 let compilation;
 
-/** Compile the bundled source locally. This does not request microphone permission. */
+/** Locate the .NET Framework compiler shipped with Windows 10/11. */
+export function findCsc(env = process.env, exists = existsSync) {
+  const roots = [env.WINDIR, env.SystemRoot, 'C:\\Windows'].filter(Boolean);
+  for (const root of roots) {
+    for (const architecture of ['Framework64', 'Framework']) {
+      const candidate = join(root, 'Microsoft.NET', architecture, 'v4.0.30319', 'csc.exe');
+      if (exists(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Compile the bundled C# helper locally. The executable is cached under
+ * %LOCALAPPDATA%\StepVoice\native and rebuilt when the source changes.
+ * This does not request microphone permission.
+ */
 export async function prepareNativeAudio() {
-  if (process.platform !== 'darwin') throw new Error('当前版本的终端音频支持 macOS；Windows/Linux 原生音频适配尚未实现。');
+  if (process.platform !== 'win32') throw new Error(`这是 Windows 版 Step Voice，只能在 Windows 上运行（当前平台：${process.platform}）。`);
   if (compilation) return compilation;
   compilation = (async () => {
-    const [source, metadata] = await Promise.all([readFile(swiftSource), readFile(infoPlist)]);
-    const digest = createHash('sha256').update(source).update(metadata).digest('hex').slice(0, 20);
-    const directory = join(tmpdir(), `step-voice-native-${process.getuid()}`);
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const info = await lstat(directory);
-    if (!info.isDirectory() || info.uid !== process.getuid() || (info.mode & 0o077)) throw new Error('原生音频缓存目录权限不安全。');
-    const executable = join(directory, `audio-${process.arch}-${digest}`);
-    try { await access(executable, constants.X_OK); return executable; } catch { /* First use compiles the source. */ }
-    const temporary = `${executable}.${process.pid}.${randomBytes(4).toString('hex')}`;
+    const source = await readFile(csSource);
+    const digest = createHash('sha256').update(source).digest('hex').slice(0, 20);
+    const directory = join(process.env.LOCALAPPDATA ?? tmpdir(), 'StepVoice', 'native');
+    await mkdir(directory, { recursive: true });
+    const executable = join(directory, `VoiceAudio-${digest}.exe`);
+    try { await access(executable, constants.F_OK); return executable; } catch { /* First use compiles the source. */ }
+    const compiler = findCsc();
+    if (!compiler) throw new Error('未找到 .NET Framework 编译器 csc.exe。Windows 10/11 自带 .NET Framework 4.x；若缺失请先安装 .NET Framework 4.8。');
+    const temporary = join(directory, `VoiceAudio-${process.pid}-${randomBytes(4).toString('hex')}.exe`);
     try {
-      await execFileAsync('xcrun', ['swiftc', '-swift-version', '5', '-O', swiftSource, '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist', '-Xlinker', infoPlist, '-o', temporary], { timeout: 60000, maxBuffer: 1024 * 1024 });
-      await rename(temporary, executable);
-      return executable;
+      await execFileAsync(compiler, [
+        '/nologo', '/target:exe', '/optimize+', '/codepage:65001', `/out:${temporary}`, csSource,
+      ], { timeout: 60000, maxBuffer: 1024 * 1024, windowsHide: true });
     } catch (error) {
       await unlink(temporary).catch(() => {});
-      throw new Error(`无法编译 macOS 音频助手。请安装 Xcode Command Line Tools（xcode-select --install）。${String(error.stderr || error.message).slice(0, 500)}`);
+      throw new Error(`无法编译 Windows 音频助手。${String(error.stderr || error.message).slice(0, 500)}`);
     }
+    try {
+      await rename(temporary, executable);
+    } catch (error) {
+      // Two Step Code sessions may compile the same digest at once; the loser
+      // reuses the winner's executable instead of failing startup.
+      await unlink(temporary).catch(() => {});
+      try { await access(executable, constants.F_OK); } catch { throw error; }
+    }
+    return executable;
   })();
   try { return await compilation; } catch (error) { compilation = undefined; throw error; }
 }
@@ -68,7 +92,15 @@ export class NativeAudioEngine {
     this.hooks.onStatus?.('permission');
     const spawnImpl = this.options.spawnImpl ?? spawn;
     const args = process.env.STEP_VOICE_ECHO_CANCEL === '1' ? ['--echo-cancel'] : [];
-    const child = spawnImpl(binary, args, { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '', TMPDIR: process.env.TMPDIR ?? tmpdir(), LANG: process.env.LANG ?? 'en_US.UTF-8' } });
+    const child = spawnImpl(binary, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: {
+        SystemRoot: process.env.SystemRoot ?? 'C:\\Windows',
+        TEMP: process.env.TEMP ?? tmpdir(),
+        TMP: process.env.TMP ?? tmpdir(),
+      },
+    });
     this.child = child;
     let diagnostics = '';
     child.stderr.on('data', (data) => { diagnostics = (diagnostics + String(data)).slice(-1500); });
@@ -83,7 +115,7 @@ export class NativeAudioEngine {
         if (error) reject(error); else resolve();
       };
       this.rejectStart = (error) => finish(error);
-      const timeout = setTimeout(() => { finish(new Error('等待麦克风权限超时。请在 macOS 系统设置中允许当前终端应用使用麦克风，再重新开始。')); void this.stop(); }, this.options.readyTimeoutMs ?? 60000);
+      const timeout = setTimeout(() => { finish(new Error('等待麦克风权限超时。请在 Windows 设置 → 隐私和安全性 → 麦克风 中允许桌面应用访问麦克风，再重新开始。')); void this.stop(); }, this.options.readyTimeoutMs ?? 60000);
       this.lines.on('line', (line) => {
         if (this.child !== child || epoch !== this.epoch || line.length > 400000) return;
         let event;

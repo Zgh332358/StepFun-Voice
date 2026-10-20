@@ -302,13 +302,27 @@ export class TerminalVoicePanel implements Component {
 			wrapDim(compact ? "停顿即直送 Step Code；忙时排队。" : "语音停顿后自动直送 Step Code；忙时排队，任务完成后朗读结果。");
 			lines.push(separator, heading("输入转写"));
 			const maxHeight = Math.max(18, Math.min(36, this.tui.terminal.rows - 4));
-			const transcriptRows = compact ? 1 : Math.max(1, maxHeight - 27);
+			const subtitleActive = Boolean(this.snapshot.subtitle?.active);
+			// 播报区预算：紧凑模式 1 行；常规模式标题 + 最多 3 行。从转写预算中扣除，避免溢出。
+			const subtitleRows = subtitleActive ? (compact ? 1 : 3) : 0;
+			const subtitleOverhead = subtitleActive ? (compact ? 1 : 4) : 0;
+			const transcriptRows = compact ? 1 : Math.max(1, maxHeight - 27 - subtitleOverhead);
 			const transcript = this.snapshot.transcripts.flatMap((entry) => {
-				const prefix = entry.role === "user" ? "你" : "Step";
-				return wrapTextWithAnsi(`${prefix}  ${clean(entry.text)}`, Math.max(1, inner - 2));
+				const prefix = entry.role === "user" ? (entry.source === "typed_text" ? "你·文字" : "你") : entry.source === "model_audio" ? "Step·语音" : "Step";
+				const marker = entry.final ? "" : this.theme.fg("accent", " ▍");
+				return wrapTextWithAnsi(`${prefix}  ${clean(entry.text)}${marker}`, Math.max(1, inner - 2));
 			});
 			for (const line of transcript.length ? transcript.slice(-transcriptRows) : ["说话停顿后即提交，请一次说完一条指令。", "文字也直接发给 Step Code，无需开启麦克风。"])
 				lines.push(row(` ${this.theme.fg("text", line)}`));
+			if (subtitleActive && this.snapshot.subtitle) {
+				const subtitle = this.snapshot.subtitle;
+				if (!compact) lines.push(separator, heading("任务播报"));
+				const chars = Array.from(clean(subtitle.text));
+				const at = Math.min(chars.length, Math.max(0, Math.round(subtitle.highlight)));
+				const body = this.theme.fg("text", chars.slice(0, at).join("")) + this.theme.fg("dim", chars.slice(at).join(""));
+				const wrapped = wrapTextWithAnsi(`${compact ? "" : "▸ "}${body}`, Math.max(1, inner - 2));
+				for (const line of wrapped.slice(-subtitleRows)) lines.push(row(` ${line}`));
+			}
 			const agent = this.agentSnapshot();
 			lines.push(separator, heading(`Step Code  ·  ${agent.waitingForApproval ? "等待你确认" : agent.busy || agent.pending ? "后台工作中" : "等待任务"}`));
 			lines.push(row(` ${clean(agent.status)}`));

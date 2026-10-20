@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { NativeAudioEngine } from '../src/native-audio.mjs';
+import { NativeAudioEngine, findCsc } from '../src/native-audio.mjs';
 
 function nativeFixture(hooks = {}) {
   const child = new EventEmitter();
@@ -29,7 +31,7 @@ test('native audio starts explicitly with pipe IPC and excludes all credential e
   assert.equal(fixture.launch, undefined);
   await fixture.start();
   assert.deepEqual(fixture.launch[2].stdio, ['pipe', 'pipe', 'pipe']);
-  assert.deepEqual(Object.keys(fixture.launch[2].env).sort(), ['HOME', 'LANG', 'PATH', 'TMPDIR']);
+  assert.deepEqual(Object.keys(fixture.launch[2].env).sort(), ['SystemRoot', 'TEMP', 'TMP']);
   assert.equal(fixture.launch[2].env.STEP_API_KEY, undefined);
   assert.equal(fixture.launch[2].env.STEPFUN_API_KEY, undefined);
   await fixture.audio.stop();
@@ -98,4 +100,26 @@ test('native startup exposes audio preparation and permission stages before read
   await fixture.start();
   assert.deepEqual(states, ['preparing', 'permission', 'ready']);
   await fixture.audio.stop();
+});
+
+test('the Windows compiler is discovered in the 64-bit .NET Framework directory first', () => {
+  const expected64 = join('C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+  const expected32 = join('C:\\Windows', 'Microsoft.NET', 'Framework', 'v4.0.30319', 'csc.exe');
+  const seen = [];
+  const csc = findCsc({ WINDIR: 'C:\\Windows' }, (candidate) => { seen.push(candidate); return candidate === expected64; });
+  assert.equal(csc, expected64);
+  assert.deepEqual(seen, [expected64], 'the 64-bit compiler is used without probing the 32-bit one');
+  assert.equal(findCsc({ WINDIR: 'C:\\Windows' }, (candidate) => candidate === expected32), expected32, '32-bit-only .NET Framework installs still work');
+  assert.equal(findCsc({ WINDIR: 'C:\\Windows' }, () => false), undefined, 'a missing .NET Framework is reported as undefined');
+});
+
+test('the Windows helper keeps the JSONL protocol and WinMM contract the controller expects', () => {
+  const source = readFileSync(new URL('../native/VoiceAudio.cs', import.meta.url), 'utf8');
+  for (const token of [
+    'waveOutOpen', 'waveOutWrite', 'waveOutReset', 'waveInOpen', 'waveInAddBuffer', 'waveInReset',
+    'Convert.ToBase64String', '--echo-cancel', 'CaptureChunkBytes = 1920', 'MaxPlaybackFrames = SampleRate * 30',
+    'playback', 'notice', 'closed',
+  ]) {
+    assert.ok(source.includes(token), `helper source must keep: ${token}`);
+  }
 });

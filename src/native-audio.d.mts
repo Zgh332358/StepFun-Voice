@@ -7,6 +7,7 @@ export interface NativeAudioHooks {
   onClosed?: () => void;
   onStatus?: (status: 'preparing' | 'permission' | 'ready') => void;
 }
+export function findCsc(env?: Record<string, string | undefined>, exists?: (path: string) => boolean): string | undefined;
 export function prepareNativeAudio(): Promise<string>;
 export class NativeAudioEngine {
   constructor(hooks?: NativeAudioHooks, options?: { binaryPath?: string; prepareImpl?: () => Promise<string>; spawnImpl?: any; readyTimeoutMs?: number });

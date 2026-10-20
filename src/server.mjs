@@ -161,11 +161,17 @@ export async function startVoiceServer(options = {}) {
         if (summary) spoken = summary;
       }
       if (Array.from(spoken).length > 80) speed = Math.min(2, Array.from(spoken).length / 80);
+      // Subtitles start before synthesis so the panel shows the exact text being
+      // read as early as possible; a stale session must not resurrect a subtitle.
+      if (active !== session || !session.ready) return;
+      const charsPerSecond = 4.5 * speed;
+      sendVoice(session, { type: 'output.subtitle.start', responseId, text: spoken, charsPerSecond });
       await synthesize(config, spoken, {
         signal, speed,
         onAudio: (chunk) => sendVoice(session, { type: 'output.audio.delta', responseId, audio: chunk.toString('base64'), sampleRate: REALTIME_SAMPLE_RATE }),
       });
     } catch { /* 播放失败不打断面板；Step Code 主终端仍是权威输出。 */ }
+    finally { if (active === session) sendVoice(session, { type: 'output.subtitle.end', responseId }); }
   }
 
   async function startSession(client, message) {

@@ -128,6 +128,51 @@ test("automatic speech barge-in clears playback without cancelling the backgroun
 	await r.controller.dispose();
 });
 
+test("TTS readout subtitles track the synthesized audio byte clock and finalize only when playback ends", async () => {
+	const r = runtime(); await r.startReady();
+	r.emit({ type: "output.subtitle.start", responseId: "tts-1", text: "一二三四五六七八九十", charsPerSecond: 4.5 });
+	let subtitle = r.controller.snapshot().subtitle;
+	assert.equal(subtitle.active, true);
+	assert.equal(subtitle.highlight, 0);
+	// PCM16 24 kHz mono = 48 bytes per millisecond; 4800 bytes ≈ 0.45 chars → still zero.
+	r.emit({ type: "output.audio.delta", responseId: "tts-1", audio: Buffer.alloc(4800).toString("base64"), sampleRate: 24000 });
+	assert.equal(r.controller.snapshot().subtitle.highlight, 0);
+	// Unrelated audio frames must not advance the subtitle clock.
+	r.emit({ type: "output.audio.delta", responseId: "voice-9", audio: Buffer.alloc(48000).toString("base64"), sampleRate: 24000 });
+	assert.equal(r.controller.snapshot().subtitle.highlight, 0);
+	// Another second (48000 bytes) → floor(4.5) = 4 chars read.
+	r.emit({ type: "output.audio.delta", responseId: "tts-1", audio: Buffer.alloc(48000).toString("base64"), sampleRate: 24000 });
+	subtitle = r.controller.snapshot().subtitle;
+	assert.equal(subtitle.highlight, 4);
+	assert.equal(r.controller.snapshot().speaking, true);
+	// subtitle.end while still playing: finalize waits for the playback tail.
+	r.emit({ type: "output.subtitle.end", responseId: "tts-1" });
+	assert.equal(r.controller.snapshot().subtitle.active, true);
+	r.engines[0].hooks.onPlayback(false);
+	subtitle = r.controller.snapshot().subtitle;
+	assert.equal(subtitle.active, false);
+	assert.equal(subtitle.highlight, 10, "finalize fills the whole text");
+	await r.controller.dispose();
+});
+
+test("subtitle.start is ignored unless the voice session is ready", async () => {
+	const r = runtime(); await r.ready();
+	r.emit({ type: "output.subtitle.start", responseId: "tts-1", text: "不应出现", charsPerSecond: 4.5 });
+	assert.equal(r.controller.snapshot().subtitle, undefined);
+	await r.controller.dispose();
+});
+
+test("stopping the call clears an active subtitle and its pending finalization", async () => {
+	const r = runtime(); await r.startReady();
+	r.emit({ type: "output.subtitle.start", responseId: "tts-1", text: "一二三四五六七八九十", charsPerSecond: 4.5 });
+	r.emit({ type: "output.audio.delta", responseId: "tts-1", audio: Buffer.alloc(48000).toString("base64"), sampleRate: 24000 });
+	r.emit({ type: "output.subtitle.end", responseId: "tts-1" });
+	assert.equal(r.controller.snapshot().subtitle.active, true, "waiting on the playback tail");
+	await r.controller.stop();
+	assert.equal(r.controller.snapshot().subtitle, undefined, "stop clears the subtitle and the finalize timer");
+	await r.controller.dispose();
+});
+
 test("native final is display-only, typed ack echoes once and generated replies stay isolated", async () => {
 	const r = runtime(); await r.startReady(); r.controller.sendText("你好");
 	assert.equal(r.controller.snapshot().transcripts.length, 0);

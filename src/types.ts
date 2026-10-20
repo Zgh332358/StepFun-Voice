@@ -67,6 +67,8 @@ export interface TerminalVoiceSnapshot {
 	agent?: AgentSnapshot;
 	transcripts: { id: string; role: "user" | "assistant"; text: string; final: boolean; source?: string }[];
 	activity: { id: number; text: string; kind: string; time: number }[];
+	/** TTS readout subtitle; highlight tracks the synthesized audio byte clock. */
+	subtitle?: { responseId: string; text: string; charsPerSecond: number; highlight: number; active: boolean };
 	notice?: { kind: string; text: string };
 	lastAgentText: string;
 	setup?: { phase: "idle" | "checking" | "saved" | "invalid"; message: string };

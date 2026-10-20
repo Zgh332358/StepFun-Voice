@@ -346,6 +346,66 @@ test('speakTasks summarizes the host result, adapts speech speed and falls back 
   assert.equal(tts.length, 3, 'isError 完成不触发朗读');
 });
 
+test('TTS readout emits subtitle.start before synthesis and subtitle.end after, mirroring the spoken text and speed', async (t) => {
+  const spoken = [];
+  let peer;
+  const { client, agent } = await fixture(t, {
+    summarize: async (config, text) => (text.length > 80 ? '长'.repeat(160) : '摘要完成'),
+    synthesizeSpeech: async (config, text, { onAudio, speed } = {}) => {
+      spoken.push({ text, speed });
+      // subtitle.start must precede the first synthesized audio frame.
+      const start = peer.messages.find((event) => event.type === 'output.subtitle.start');
+      assert.ok(start, 'subtitle.start arrives before synthesis audio');
+      assert.equal(start.text, text, 'subtitle mirrors the exact spoken text');
+      assert.equal(start.charsPerSecond, 4.5 * speed, 'subtitle clock matches the adaptive speech speed');
+      onAudio(Buffer.alloc(4800));
+      return { audio: Buffer.alloc(4800), format: 'pcm16', sampleRate: 24000 };
+    },
+  });
+  peer = await client(); peer.send({ type: 'voice.start' });
+  await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
+  agent.emit({ type: 'agent.complete', requestId: 'request-1', requestIds: ['request-1'], text: '任务已完成。' });
+  const end = await peer.wait((event) => event.type === 'output.subtitle.end');
+  assert.equal(end.responseId, 'tts-1');
+  assert.equal(peer.messages.find((event) => event.type === 'output.subtitle.start').text, '摘要完成');
+  assert.equal(spoken.length, 1);
+});
+
+test('subtitle still mirrors the fallback tail when summarization fails', async (t) => {
+  let peer;
+  const { client, agent } = await fixture(t, {
+    summarize: async () => { throw new Error('summary down'); },
+    synthesizeSpeech: async (config, text, { onAudio } = {}) => {
+      const start = peer.messages.find((event) => event.type === 'output.subtitle.start');
+      assert.equal(start.text, text, 'subtitle mirrors the fallback text exactly');
+      assert.match(start.text, /^……y{100}$/);
+      onAudio(Buffer.alloc(4800));
+      return { audio: Buffer.alloc(4800), format: 'pcm16', sampleRate: 24000 };
+    },
+  });
+  peer = await client(); peer.send({ type: 'voice.start' });
+  await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
+  agent.emit({ type: 'agent.complete', requestId: 'request-1', requestIds: ['request-1'], text: 'y'.repeat(1000) });
+  await peer.wait((event) => event.type === 'output.subtitle.end');
+});
+
+test('ending the call while summarization is in flight never emits subtitle events for the stale session', async (t) => {
+  let resolveSummary;
+  const { client, agent } = await fixture(t, {
+    summarize: () => new Promise((resolve) => { resolveSummary = resolve; }),
+    synthesizeSpeech: async () => { throw new Error('a stale session must not synthesize'); },
+  });
+  const peer = await client(); peer.send({ type: 'voice.start' });
+  await peer.wait((event) => event.type === 'voice.state' && event.state === 'ready');
+  agent.emit({ type: 'agent.complete', requestId: 'request-1', requestIds: ['request-1'], text: '任务完成' });
+  await pause(30);
+  peer.send({ type: 'voice.stop' });
+  await peer.wait((event) => event.type === 'voice.state' && event.state === 'stopped');
+  resolveSummary('迟到');
+  await pause(50);
+  assert.equal(peer.messages.some((event) => event.type.startsWith('output.subtitle')), false, 'no subtitle events for a stopped session');
+});
+
 test('speech order wins over final arrival order and identical separate inputs both submit', async (t) => {
   const { client, providers, agent } = await fixture(t);
   const peer = await client(); peer.send({ type: 'voice.start' });
