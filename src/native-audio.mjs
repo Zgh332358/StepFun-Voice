@@ -38,7 +38,15 @@ export async function prepareNativeAudio() {
     const directory = join(process.env.LOCALAPPDATA ?? tmpdir(), 'StepVoice', 'native');
     await mkdir(directory, { recursive: true });
     const executable = join(directory, `VoiceAudio-${digest}.exe`);
-    try { await access(executable, constants.F_OK); return executable; } catch { /* First use compiles the source. */ }
+    try {
+      await access(executable, constants.F_OK);
+      // The cache directory is per-user (%LOCALAPPDATA%), but the cached exe
+      // itself is verified against the source digest so a replaced file is
+      // recompiled instead of executed (parity with the macOS uid/mode check).
+      const cached = createHash('sha256').update(await readFile(executable)).digest('hex').slice(0, 20);
+      if (cached === digest) return executable;
+      await unlink(executable).catch(() => {});
+    } catch { /* First use compiles the source. */ }
     const compiler = findCsc();
     if (!compiler) throw new Error('未找到 .NET Framework 编译器 csc.exe。Windows 10/11 自带 .NET Framework 4.x；若缺失请先安装 .NET Framework 4.8。');
     const temporary = join(directory, `VoiceAudio-${process.pid}-${randomBytes(4).toString('hex')}.exe`);
