@@ -4,7 +4,7 @@
 
 > 本插件由阶跃星辰 **Step 5 Preview** 模型驱动开发（Step Code 编码代理内完成全部设计与实现）。
 
-> **这是 Windows 版**，与 macOS 版（Swift 音频助手）隔离维护、互不影响。macOS 版的 Swift 代码与 Xcode 编译流程不在此目录中。
+> **这是 Windows 版**。两个平台版本并存于同一仓库：Windows 版在 `windows` 分支，macOS 版在 `main` 分支（Swift 音频助手），互不覆盖。
 
 Step Voice 是可单独加载的 Step Code 终端语音插件，让编码代理拥有 Codex 式的语音工作流：
 
@@ -57,6 +57,18 @@ flowchart TB
 ## 安装与启动
 
 当前原生音频支持 **Windows 10 / 11**，需要 Node.js **22.19 或更高版本**、已安装的 Step Code，以及系统自带的 **.NET Framework 4.x**（Win10/11 内置，无需单独安装）。首次开始语音时会用 `csc.exe` 编译音频助手并缓存；缺少编译器时面板会提示安装 .NET Framework 4.8。不需要 Xcode、Swift 或任何额外音频依赖。
+
+### 从 GitHub 安装
+
+Windows 版位于 `windows` 分支，macOS 版位于 `main` 分支。在要使用语音的项目目录执行：
+
+```powershell
+# Windows 版
+step install -l git:github.com/Zgh332358/StepFun-Voice@windows
+
+# macOS 版（默认 main，不要加 @windows）
+step install -l git:github.com/Zgh332358/StepFun-Voice
+```
 
 ### 安装（本地目录）
 
@@ -297,7 +309,7 @@ C# 音频助手需要在真实 Windows 设备上完成首次编译与运行，�
 
 ## 边界与限制
 
-- 原生音频当前实现于 **Windows**（WinMM waveIn/waveOut，系统自带 .NET Framework 编译）；macOS 版在独立目录维护（Swift 音频助手）；Linux 未实现。
+- 原生音频当前实现于 **Windows**（WinMM waveIn/waveOut，系统自带 .NET Framework 编译）；macOS 版在同仓库的 `main` 分支维护（Swift 音频助手）；Linux 未实现。
 - 实际延迟、中文识别、音色效果、扬声器回声表现，需要在配置 Key 的 Windows 设备上验证。VAD 由 StepFun 服务端判定，网络延迟与录音环境会影响打断速度。
 - Windows 不提供系统回声消除（AEC）；默认播放期间自动静音麦克风，外放场景建议佩戴耳机。
 - 总结模型 `step-3.7-flash` 为思考型模型，朗读前有几秒总结延迟；若账号无此模型，朗读自动回退为结尾截断并在面板提示。

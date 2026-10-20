@@ -2,7 +2,7 @@
 
 GitHub 可以直接托管这个终端语音插件。Step Code 支持从 Git 仓库 clone、安装运行依赖并注册 extension，因此不需要 npm 账号或 npm 包发布。本插件没有 npx 安装器和 npm 发布脚本，`package.json` 的 `private: true` 阻止意外 npm 发布。
 
-插件面向 Windows 分发。原 macOS 版本使用独立的 [Zgh332358/StepFun-Voice 仓库](https://github.com/Zgh332358/StepFun-Voice)；本 Windows 版推送到你自己的 GitHub 仓库后，把下文命令里的仓库地址替换为该地址即可。
+插件面向 Windows 分发。macOS 版与 Windows 版并存于同一个 [Zgh332358/StepFun-Voice 仓库](https://github.com/Zgh332358/StepFun-Voice)：macOS 在 `main` 分支，Windows 在 `windows` 分支。下文命令指向 `windows` 分支，两个分支各自是完整的插件根目录。
 
 ## 仓库结构
 
@@ -32,7 +32,7 @@ StepFun-Voice/
 开发时 clone 源码仓库，在自己的 checkout 中修改和测试：
 
 ```powershell
-git clone <你的仓库地址>
+git clone -b windows https://github.com/Zgh332358/StepFun-Voice.git StepFun-Voice-Windows
 cd StepFun-Voice-Windows
 npm install --no-audit --no-fund
 # TUI 测试使用已安装依赖的 Step Code 源码 checkout。
@@ -47,7 +47,7 @@ npm test
 用户需要先安装 Step Code、Node.js 22.19 或更高版本、Git，以及 Windows 10/11 系统自带的 .NET Framework 4.x（无需单独安装）。在目标项目中执行：
 
 ```powershell
-step install -l git:github.com/<你的账号>/StepFun-Voice-Windows
+step install -l git:github.com/Zgh332358/StepFun-Voice@windows
 ```
 
 Step Code 会 clone 到当前项目 `.stepcode\git\` 中，自动处理 `ws` 运行依赖，并把插件来源注册到项目 `.stepcode\config.toml`。不带 `-l` 时使用用户范围，clone 放到 `%USERPROFILE%\.stepcode\agent\git\`，来源保存在 `%USERPROFILE%\.stepcode\config.toml`。
@@ -67,17 +67,17 @@ step
 
 ```powershell
 step list
-step update --extension git:github.com/<你的账号>/StepFun-Voice-Windows
-step remove -l git:github.com/<你的账号>/StepFun-Voice-Windows
+step update --extension git:github.com/Zgh332358/StepFun-Voice
+step remove -l git:github.com/Zgh332358/StepFun-Voice@windows
 ```
 
-更新命令不带 `-l`，按仓库身份匹配用户与当前项目已配置的来源。不固定 ref 时更新当前跟踪分支。用户范围卸载使用不带 `-l` 的 remove。
+更新命令不带 `-l`，按仓库身份匹配用户与当前项目已配置的来源。Windows 版的 ref 是 `windows` 分支；用户范围卸载使用不带 `-l` 的 remove。
 
-要发布明确版本，先在插件仓库创建并推送对应 tag，例如 `v0.2.0`；随后可在 GitHub 创建 Release。GitHub Release 会提供该 tag 的源码 ZIP / tarball，也可以附加手动制作的 ZIP。
+两个版本共用一个仓库，版本 tag 建议加平台前缀，例如 `windows-v0.2.0`，避免与 macOS 版 tag 混淆。GitHub Release 会提供该 tag 的源码 ZIP / tarball，也可以附加手动制作的 ZIP。
 
 ```powershell
-# 在仓库确实存在 v0.2.0 tag 后使用。
-step install -l git:github.com/<你的账号>/StepFun-Voice-Windows@v0.2.0
+# 在仓库确实存在 windows-v0.2.0 tag 后使用。
+step install -l git:github.com/Zgh332358/StepFun-Voice@windows-v0.2.0
 ```
 
 固定 tag / commit 的配置不会随普通更新切换到新版本；升级时用新 ref 重新执行 install。Step Code 管理的 clone 是安装缓存，更新会重置并清理其中的改动，开发修改应在自己的源码目录中进行。
