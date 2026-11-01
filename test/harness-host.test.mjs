@@ -55,7 +55,7 @@ async function host(t, loadPlugin = false) {
   return { sdk, providers, session, faux, dir };
 }
 
-hostTest('real extension loader registers the host provider and /voice uses no legacy relay or microphone', async t => {
+hostTest('real extension loader registers the host provider and /stepvoice uses no legacy relay or microphone', async t => {
   t.mock.method(NativeAudioEngine.prototype, 'start', () => { throw new Error('Menus must not open a microphone'); });
   t.mock.method(Server.prototype, 'listen', () => { throw new Error('The new host must not start the legacy relay'); });
   const h = await host(t, true);
@@ -65,7 +65,7 @@ hostTest('real extension loader registers the host provider and /voice uses no l
     notify() { assert.fail('RPC voice controls should use the existing dialog adapter'); },
   } });
   assert.ok(h.session.voice.snapshot().providers.some(provider => provider.id === 'stepfun'));
-  await h.session.prompt('/voice', { source: 'rpc' });
+  await h.session.prompt('/stepvoice', { source: 'rpc' });
   assert.match(dialogs[0]?.title ?? '', /Step Voice · 当前桌面会话/);
   assert.equal(h.session.voice.snapshot().state, 'stopped');
   assert.equal(h.faux.state.callCount, 0);

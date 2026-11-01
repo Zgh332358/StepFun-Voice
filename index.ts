@@ -6,10 +6,10 @@ import type { TerminalVoicePanel } from "./src/terminal-ui.ts";
 import type { TerminalVoiceController, TerminalVoiceSnapshot, VoiceServerHandle } from "./src/types.ts";
 
 const CONFIG_HELP = [
-	"桌面端：/voice panel 打开壳内语音弹窗（不开始录音）；/voice setup 配置接入通道与 Key；/voice mute|interrupt|end 控制通话。",
-	"运行 /voice setup，按引导选择接入通道（开放平台 API / Step Plan）并输入 API Key；Key 会先实时验证再保存。",
+	"桌面端：/stepvoice 打开壳内语音弹窗（不开始录音）；/stepvoice setup 配置接入通道与 Key；/stepvoice mute|interrupt|end 控制通话。",
+	"运行 /stepvoice setup，按引导选择接入通道（开放平台 API / Step Plan）并输入 API Key；Key 会先实时验证再保存。",
 	"API Key 在 https://platform.stepfun.com/interface-key 创建；Step Plan 通道需要账号已订阅套餐。",
-	"也可以在启动 StepCode 前 export STEP_API_KEY='你的 Key'（同样支持 STEPFUN_API_KEY）。桌面端从 Finder 启动不继承终端 export，建议在 /voice setup 中配置。",
+	"也可以在启动 StepCode 前 export STEP_API_KEY='你的 Key'（同样支持 STEPFUN_API_KEY）。桌面端从 Finder 启动不继承终端 export，建议在 /stepvoice setup 中配置。",
 	"可选：STEP_VOICE_REALTIME_MODEL、STEP_VOICE_TTS_MODEL、STEP_VOICE_VOICE。",
 ].join("\n");
 const ACTIONS = ["panel", "setup", "start", "mute", "interrupt", "end", "stop", "status", "config"];
@@ -78,7 +78,7 @@ export default function stepVoice(pi: ExtensionAPI): void {
 	};
 
 	const ensureController = async (ctx: ExtensionContext): Promise<TerminalVoiceController> => {
-		if (disposed) throw new Error("当前语音插件已随旧会话关闭，请在新会话运行 /voice。");
+		if (disposed) throw new Error("当前语音插件已随旧会话关闭，请在新会话运行 /stepvoice。");
 		bindContext(ctx);
 		if (controller) return controller;
 		if (!starting) {
@@ -203,7 +203,7 @@ export default function stepVoice(pi: ExtensionAPI): void {
 		const save = voice.saveCredentials(channel as "api" | "step_plan", apiKey, useEnvKey);
 		// Verification is async; keep a status dialog so the user can cancel focus without orphaning it.
 		const done = await Promise.race([save, desktopSelect(ctx, "正在验证 Key 和通道…", ["继续等待", "取消等待"], 30_000).then(() => undefined as never)]);
-		if (done === undefined) { void save.catch(() => {}); await report(ctx, "已取消等待；若验证随后完成，Key 仍会保存。可用 /voice status 查看。"); return; }
+		if (done === undefined) { void save.catch(() => {}); await report(ctx, "已取消等待；若验证随后完成，Key 仍会保存。可用 /stepvoice status 查看。"); return; }
 		await report(ctx, done.ok ? "验证通过，已保存接入设置。" : `Key 验证未通过：${done.message}`, done.ok ? "info" : "error");
 	}
 
@@ -245,7 +245,7 @@ export default function stepVoice(pi: ExtensionAPI): void {
 	});
 	// Yield focus: when the host starts a turn or raises a non-voice prompt,
 	// dismiss our dialog. A call in progress keeps running (dictation may be the
-	// task itself); /voice end still works and executes even while streaming.
+	// task itself); /stepvoice end still works and executes even while streaming.
 	const yieldToHost = (): void => { panel?.close(); panel = undefined; dismissDesktopDialog(); };
 	pi.on("before_agent_start", yieldToHost);
 	pi.on("agent_start", yieldToHost);
@@ -255,8 +255,8 @@ export default function stepVoice(pi: ExtensionAPI): void {
 	});
 	bridge.agent.subscribe(() => updateWidget());
 
-	pi.registerCommand("voice", {
-		description: "StepFun voice in StepCode terminal / macOS desktop (/voice setup|panel|start|mute|interrupt|end|stop|status|config)",
+	pi.registerCommand("stepvoice", {
+		description: "StepFun voice in StepCode terminal / macOS desktop (/stepvoice setup|panel|start|mute|interrupt|end|stop|status|config)",
 		getArgumentCompletions: (prefix) => ACTIONS.filter(value => value.startsWith(prefix.trim())).map(value => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			bindContext(ctx);
@@ -268,15 +268,15 @@ export default function stepVoice(pi: ExtensionAPI): void {
 				if (action === "config") { await report(ctx, CONFIG_HELP); return; }
 				if (action === "status") {
 					const state = controller?.snapshot();
-					await report(ctx, state ? desktopStatusText(state) : "语音尚未启动。运行 /voice 打开控制。"); return;
+					await report(ctx, state ? desktopStatusText(state) : "语音尚未启动。运行 /stepvoice 打开控制。"); return;
 				}
 				if (action === "stop") { await close(); await report(ctx, "语音服务已关闭。"); return; }
-				if (action && !ACTIONS.includes(action)) { await report(ctx, "用法：/voice [setup|panel|start|mute|interrupt|end|stop|status|config]", "warning"); return; }
+				if (action && !ACTIONS.includes(action)) { await report(ctx, "用法：/stepvoice [setup|panel|start|mute|interrupt|end|stop|status|config]", "warning"); return; }
 				if (ctx.mode === "rpc" && process.platform !== "darwin") { await report(ctx, "本分支的桌面原生音频适配仅支持 macOS。", "error"); return; }
 				if (ctx.mode === "tui") terminalUI ??= await import("./src/terminal-ui.ts");
 				const voice = await ensureController(ctx);
 				if (action === "start") {
-					if (!voice.snapshot().config.keyConfigured) { await report(ctx, "还没有配置 API Key。运行 /voice setup 完成接入设置。", "warning"); return; }
+					if (!voice.snapshot().config.keyConfigured) { await report(ctx, "还没有配置 API Key。运行 /stepvoice setup 完成接入设置。", "warning"); return; }
 					await voice.start(); updateWidget(); return;
 				}
 				if (action === "mute") { voice.mute(); updateWidget(); return; }
@@ -285,7 +285,7 @@ export default function stepVoice(pi: ExtensionAPI): void {
 				if (ctx.mode === "rpc") { await desktopMenu(ctx, voice, action === "setup"); return; }
 				if (!ctx.isIdle()) {
 					updateWidget();
-					await report(ctx, "StepCode 正在工作，语音控件保留在终端。可用 /voice mute、/voice interrupt、/voice end 控制；任务结束后 /voice 打开面板。"); return;
+					await report(ctx, "StepCode 正在工作，语音控件保留在终端。可用 /stepvoice mute、/stepvoice interrupt、/stepvoice end 控制；任务结束后 /stepvoice 打开面板。"); return;
 				}
 				if (panel) { await report(ctx, "语音面板已经打开。Esc 收起可返回 StepCode。"); return; }
 				bridge.setVoicePanelOpen(true);

@@ -42,7 +42,7 @@ pnpm step --no-extensions -e /path/to/StepFun-Voice/index.ts
 `--no-extensions` 在这个开发进程中关闭自动扩展发现，仍加载显式 `-e` 指定的插件，
 避免与已安装旧副本重复注册；它不修改安装配置。
 
-在这个开发 CLI 中使用 `/voice setup` 配置语音接入，之后再明确开始录音。
+在这个开发 CLI 中使用 `/stepvoice setup` 配置语音接入，之后再明确开始录音。
 编码模型沿用该 CLI 会话的模型与认证；语音 Key 仍由插件的后端配置保管。
 不要把 Key 写进命令消息、模型上下文、RPC 示例或调试日志。
 
@@ -78,7 +78,7 @@ STEP_CODE_VOICE_SOURCE=/path/to/patched-Step-Code npm run check:types
 
 验证包含：
 
-1. 实际 extension loader 注册 provider，`/voice` 不创建旧 relay、不自动录音。
+1. 实际 extension loader 注册 provider，`/stepvoice` 不创建旧 relay、不自动录音。
 2. 原生控制器适配 → StepFun 事件解析 → 真实 AgentSession → faux 编码模型 → 摘要/TTS 模拟输出。
 3. 构建后 CLI 子进程的真实 JSONL RPC：启停、音频输入、一次任务接收、输出音频和正常退出。
 4. 宿主侧的去重、取消、队列移除、失败回收、权限拒绝、旧会话与事件顺序回归。

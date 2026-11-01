@@ -12,7 +12,7 @@ import vm from 'node:vm';
 const hostRoot = process.env.STEP_CODE_HOST;
 const hostTest = hostRoot ? test : test.skip;
 
-hostTest('real desktop host dispatches /voice into an in-app dialog menu without browser or model turn', async t => {
+hostTest('real desktop host dispatches /stepvoice into an in-app dialog menu without browser or model turn', async t => {
   const coding = pathToFileURL(join(hostRoot, 'coding-agent/dist/index.js')).href;
   const { SelectionBroker, selectionSelect } = await import(pathToFileURL(join(hostRoot, 'web/dist/selection.js')).href);
   const h = await import(coding);
@@ -31,7 +31,8 @@ hostTest('real desktop host dispatches /voice into an in-app dialog menu without
     noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
   await loader.reload();
   assert.deepEqual(loader.getExtensions().errors, []);
-  assert.ok(loader.getExtensions().extensions.some(e => e.commands.has('voice')));
+  assert.ok(loader.getExtensions().extensions.some(e => e.commands.has('stepvoice')));
+  assert.ok(loader.getExtensions().extensions.every(e => !e.commands.has('voice')));
   const modelRuntime = await h.ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null,
     modelsStorePath: join(dir, 'models-store.json'), includeDefaultBuiltins: false, refreshOnCreate: false });
   const model = { provider: 'test', id: 'test', name: 'Test only', api: 'openai-completions', baseUrl: 'http://127.0.0.1:1',
@@ -51,7 +52,7 @@ hostTest('real desktop host dispatches /voice into an in-app dialog menu without
   await session.bindExtensions({ mode: 'rpc', uiContext: { select: selectionSelect(broker),
     notify() { assert.fail('real RPC flow must not depend on notify'); } } });
   const countBefore = manager.getEntries().filter(e => e.type === 'message').length;
-  for (const command of ['/voice', '/voice panel']) {
+  for (const command of ['/stepvoice', '/stepvoice panel']) {
     selected = undefined;
     const open = session.prompt(command, { source: 'rpc' });
     for (let i = 0; i < 100 && !selected; i++) await new Promise(resolve => setTimeout(resolve, 10));
@@ -69,27 +70,38 @@ hostTest('real desktop host dispatches /voice into an in-app dialog menu without
   }
 });
 
-hostTest('installed desktop slash-menu reproduces bare /voice skill collision; argument form bypasses it', async () => {
+hostTest('bare /stepvoice avoids the old voice skill collision in the installed desktop menu', async () => {
   const publicDir = join(hostRoot, 'web/dist/public');
   const html = await readFile(join(publicDir, 'index.html'), 'utf8');
   const asset = html.match(/src="\/([^"\s]+\.js)"/)[1];
   const bundle = await readFile(join(publicDir, asset), 'utf8');
   // Scope to the actual shipped slash matching functions, not a rewritten mock.
-  const start = bundle.indexOf('function Iu(e,t){let n=e.toLowerCase()');
-  const end = bundle.indexOf('var Gu=`prompt-file`', start);
-  assert.ok(start >= 0 && end > start, 'host bundle changed; re-evaluate the verified 0.2.0 slash-menu contract');
+  const start = bundle.search(/function [\w$]+\(e,t\)\{let n=e\.toLowerCase\(\),r=t\.toLowerCase\(\)/);
+  const boundary = start < 0 ? -1 : bundle.slice(start).search(/var [\w$]+=`prompt-file`/);
+  assert.ok(start >= 0 && boundary > 0, 'host slash-menu structure changed; inspect its current contract');
+  const section = bundle.slice(start, start + boundary);
+  const candidatesName = /function ([\w$]+)\(e,t,n,r=\[\]\)/.exec(section)?.[1];
+  const queryName = /function ([\w$]+)\(e\)\{let t=[^;]+;return t\?t\[1\]:null\}/.exec(section)?.[1];
+  const caretName = /function ([\w$]+)\(e,t\)\{if\(t<0\|\|t>e\.length\)return null/.exec(section)?.[1];
+  assert.ok(candidatesName && queryName && caretName, 'expected the shipped candidate and query functions');
   const runtime = await readFile(join(hostRoot, 'web/dist/runtime.js'), 'utf8');
   assert.match(runtime, /return webPromptCommands\(this\.session\.promptTemplates,/,
     'the desktop endpoint lists prompt templates, not registered extension commands');
   const context = vm.createContext({});
-  vm.runInContext(bundle.slice(start, end), context);
-  const candidates = vm.runInContext('Uu("voice",[{name:"voice-of-customer-miner",description:"review research"}],x=>x,[])', context);
+  vm.runInContext(section, context, { timeout: 1000 });
+  const candidatesFor = query => vm.runInContext(`${candidatesName}(${JSON.stringify(query)},[{name:"voice-of-customer-miner",description:"review research"}],x=>x,[])`, context, { timeout: 1000 });
+  const call = (name, ...args) => vm.runInContext(`${name}(...${JSON.stringify(args)})`, context, { timeout: 1000 });
+  const candidates = candidatesFor('voice');
   assert.equal(candidates.commands.length, 0);
   assert.equal(candidates.prompts.length, 0);
   assert.equal(candidates.skills[0].key, 'voice-of-customer-miner');
-  assert.equal(vm.runInContext('Bu("/voice panel")', context), null);
-  assert.equal(vm.runInContext('Bu("/voice setup")', context), null);
-  assert.equal(vm.runInContext('Vu("/voice panel",12)', context), null);
-  assert.match(bundle, /e===`Enter`\|\|e===`Tab`\?\(r\(c\[p\]\),!0\)/,
+  const renamed = candidatesFor('stepvoice');
+  assert.equal(renamed.commands.length + renamed.prompts.length + renamed.skills.length, 0,
+    'bare /stepvoice must not select Voice Of Customer Miner');
+  assert.equal(call(queryName, '/stepvoice'), 'stepvoice');
+  assert.equal(call(queryName, '/stepvoice panel'), null);
+  assert.equal(call(queryName, '/stepvoice setup'), null);
+  assert.equal(call(caretName, '/stepvoice panel', 16), null);
+  assert.match(bundle, /e===`Enter`\|\|e===`Tab`\?\([\w$]+\([\w$]+\[[\w$]+\]\),!0\)/,
     'Enter selects a candidate before the editor submits its text');
 });

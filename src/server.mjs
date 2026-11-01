@@ -70,8 +70,8 @@ export function speechSummary(text) {
 }
 
 function unattachedAgent(cwd) {
-  const snapshot = () => ({ sessionId: '', cwd, busy: false, pending: false, waitingForApproval: false, status: '未连接 Step Code；从 Step Code 的 /voice 命令启动可执行任务', lastResponse: '' });
-  return { snapshot, subscribe: () => () => {}, submit: () => { throw new Error('当前是独立语音面板。请在 Step Code 中使用 /voice 连接当前编码任务。'); }, cancel: () => { throw new Error('未连接 Step Code Agent'); } };
+  const snapshot = () => ({ sessionId: '', cwd, busy: false, pending: false, waitingForApproval: false, status: '未连接 Step Code；从 Step Code 的 /stepvoice 命令启动可执行任务', lastResponse: '' });
+  return { snapshot, subscribe: () => () => {}, submit: () => { throw new Error('当前是独立语音面板。请在 Step Code 中使用 /stepvoice 连接当前编码任务。'); }, cancel: () => { throw new Error('未连接 Step Code Agent'); } };
 }
 
 /** Local-only relay. The upstream key never leaves this process. */
@@ -250,11 +250,11 @@ export async function startVoiceServer(options = {}) {
     try { pathname = new URL(request.url, 'http://localhost').pathname; }
     catch { response.writeHead(400).end('Invalid request URL'); return; }
     if (pathname === '/healthz') { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify({ ok: true, agentConnected })); return; }
-    if (pathname === '/') { response.setHeader('Content-Type', 'text/plain; charset=utf-8'); response.end('Step Voice terminal relay. Open /voice inside Step Code.'); return; }
+    if (pathname === '/') { response.setHeader('Content-Type', 'text/plain; charset=utf-8'); response.end('Step Voice terminal relay. Open /stepvoice inside Step Code.'); return; }
     response.writeHead(404).end('Not found');
   });
   // Upgraded sockets can outlive ws.close() in a Bun-compiled host. Own the
-  // transport sockets so /voice stop and extension reload also close HTTP.
+  // transport sockets so /stepvoice stop and extension reload also close HTTP.
   server.on('connection', (socket) => {
     connections.add(socket);
     socket.once('close', () => connections.delete(socket));

@@ -46,7 +46,7 @@ export function createVoiceAgentBridge(pi: ExtensionAPI, { taskStartTimeoutMs = 
 	const listeners = new Set<(event: VoiceAgentEvent) => void>();
 
 	const requireContext = (): ExtensionContext => {
-		if (disposed || !context) throw new Error("当前 Step Code 会话已关闭。请重新运行 /voice。");
+		if (disposed || !context) throw new Error("当前 Step Code 会话已关闭。请重新运行 /stepvoice。");
 		return context;
 	};
 

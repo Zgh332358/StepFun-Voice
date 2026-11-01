@@ -37,18 +37,26 @@ function rpcHost(t, { keyConfigured = true } = {}) {
       notify() { assert.fail('desktop flow must use dialogs, not notify'); },
       custom() { assert.fail('desktop must not use TUI custom'); } } };
   stepVoice(pi);
-  return { dialogs, execs, ctx, command: commands.get('voice'), events: pi,
+  return { dialogs, execs, ctx, commands, command: commands.get('stepvoice'), events: pi,
     resolveCurrent(value) { const a = answer; answer = undefined; a?.(value); },
     hasPendingDialog: () => Boolean(answer),
     async shutdown() { for (const fn of pi.listeners('session_shutdown')) await fn({}, ctx); } };
 }
 
-test('explicit /voice panel opens controls without recording or credential prompts', async t => {
+test('registers stepvoice as the only user command with the existing subcommands', t => {
+  const r = rpcHost(t, { keyConfigured: false }); t.after(() => r.shutdown());
+  assert.deepEqual([...r.commands.keys()], ['stepvoice']);
+  assert.deepEqual(r.commands.get('stepvoice').getArgumentCompletions('').map(item => item.value),
+    ['panel', 'setup', 'start', 'mute', 'interrupt', 'end', 'stop', 'status', 'config']);
+  assert.equal(r.execs.length, 0);
+});
+
+test('explicit /stepvoice panel opens controls without recording or credential prompts', async t => {
   const r = rpcHost(t, { keyConfigured: false }); t.after(() => r.shutdown());
   const pending = r.command.handler('panel', r.ctx);
   await waitDialog(r);
   assert.match(r.dialogs.at(-1).title, /Step Voice · 当前桌面会话/);
-  assert.match(r.dialogs.at(-1).title, /\/voice setup/);
+  assert.match(r.dialogs.at(-1).title, /\/stepvoice setup/);
   assert.doesNotMatch(r.dialogs.at(-1).title, /在语音面板按 Enter/);
   assert.ok(r.dialogs.at(-1).items.includes('关闭（结束通话）'));
   r.resolveCurrent('关闭（结束通话）');

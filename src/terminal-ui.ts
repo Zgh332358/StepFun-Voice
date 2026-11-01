@@ -51,7 +51,7 @@ export function voiceStateLabel(state: TerminalVoiceSnapshot): string {
 export function voiceWidgetLines(state: TerminalVoiceSnapshot, agent: AgentSnapshot, theme: VoiceTheme): string[] {
 	const accent = state.voice === "ready" ? "success" : state.voice === "error" ? "error" : "accent";
 	const status = theme.fg(accent, `● Step Voice · ${voiceStateLabel(state)}`);
-	const lines = [status + theme.fg("dim", "  /voice · /voice mute · /voice interrupt · /voice end")];
+	const lines = [status + theme.fg("dim", "  /stepvoice · /stepvoice mute · /stepvoice interrupt · /stepvoice end")];
 	lines.push(theme.fg(agent.waitingForApproval ? "warning" : "dim", `  ${clean(agent.status)}${agent.busy || agent.pending ? " · 后台工作时语音保持在线" : ""}`));
 	if (agent.waitingForApproval) lines.push(theme.fg("warning", "  请在主终端处理权限确认；语音不会代为批准。"));
 	const activity = state.activity.at(-1);

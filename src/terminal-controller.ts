@@ -131,7 +131,7 @@ export interface NormalizedVoiceEvent {
 type NormalizedEvent = NormalizedVoiceEvent;
 type SnapshotListener = (snapshot: TerminalVoiceSnapshot, event?: NormalizedEvent) => void;
 
-const ENV_HELP = "还没有配置 API Key。请运行 /voice setup，按引导选择通道并输入 Key；也可以在启动 Step Code 前 export STEP_API_KEY。";
+const ENV_HELP = "还没有配置 API Key。请运行 /stepvoice setup，按引导选择通道并输入 Key；也可以在启动 Step Code 前 export STEP_API_KEY。";
 const MAX_HISTORY = 100;
 const MAX_TEXT = 12_000;
 const DefaultWebSocket = createRequire(import.meta.url)("ws") as VoiceSocketConstructor;
@@ -206,7 +206,7 @@ export class TerminalVoiceController {
 		this.emit();
 	}
 	private send(message: { type: string; [key: string]: unknown }): void {
-		if (this.disposed || !this.socket || this.socket.readyState !== 1) throw new Error("本地语音服务未连接。请重新运行 /voice。");
+		if (this.disposed || !this.socket || this.socket.readyState !== 1) throw new Error("本地语音服务未连接。请重新运行 /stepvoice。");
 		this.socket.send(JSON.stringify(message));
 	}
 	private addActivity(text: string, kind: "info" | "error" = "info"): void {
@@ -327,7 +327,7 @@ export class TerminalVoiceController {
 					const url = new URL(this.options.url || "");
 					if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.username || url.password) throw new Error("语音控制器只接受插件生成的本机服务地址。");
 					const token = new URLSearchParams(url.hash.slice(1)).get("token") || url.hash.slice(1);
-					if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("本地语音连接凭证无效，请重新运行 /voice。");
+					if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("本地语音连接凭证无效，请重新运行 /stepvoice。");
 					const Socket = this.options.WebSocketImpl || DefaultWebSocket;
 					this.socket = new Socket(`ws://${url.host}/ws`, ["step-voice", token], { headers: { Origin: url.origin } });
 				}
@@ -341,11 +341,11 @@ export class TerminalVoiceController {
 				});
 				this.socket.on("close", () => {
 					this.state.connection = "disconnected"; this.state.agentConnected = false;
-					this.failConnection(new Error("本地语音服务已关闭，请重新运行 /voice。"));
+					this.failConnection(new Error("本地语音服务已关闭，请重新运行 /stepvoice。"));
 					void this.stop(false);
 				});
 				this.connectTimer = setTimeout(() => {
-					this.failConnection(new Error("本地语音服务连接超时，请重新运行 /voice。")); this.socket?.close();
+					this.failConnection(new Error("本地语音服务连接超时，请重新运行 /stepvoice。")); this.socket?.close();
 				}, this.options.connectTimeoutMs ?? 8000);
 				this.options.transport?.open();
 			} catch (error) { this.failConnection(new Error(errorText(error))); }
@@ -392,7 +392,7 @@ export class TerminalVoiceController {
 
 	/** Only an explicit terminal Start command may call this; connect() never opens the microphone. */
 	async start(): Promise<void> {
-		if (this.disposed) throw new Error("语音控制器已关闭。请重新运行 /voice。");
+		if (this.disposed) throw new Error("语音控制器已关闭。请重新运行 /stepvoice。");
 		if (this.state.connection !== "connected") await this.connect();
 		if (this.state.voice === "ready" || this.state.voice === "connecting") return;
 		if (!this.state.config.keyConfigured) { this.notice(ENV_HELP, "warning"); return; }
@@ -487,7 +487,7 @@ export class TerminalVoiceController {
 	}
 	sendText(text: string): void { this.submitTask(text); }
 	submitTask(text: string, delivery: VoiceDelivery = "followUp"): void {
-		if (!this.state.agentConnected) throw new Error("后台编码任务未连接，请从 Step Code 当前会话运行 /voice。");
+		if (!this.state.agentConnected) throw new Error("后台编码任务未连接，请从 Step Code 当前会话运行 /stepvoice。");
 		if (delivery !== "steer" && delivery !== "followUp") throw new Error("任务发送方式无效。");
 		const value = this.textValue(text);
 		this.send({ type: "agent.submit", text: value, delivery });

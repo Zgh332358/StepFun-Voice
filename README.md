@@ -8,15 +8,17 @@
 
 Step Voice 是为**当前 StepCode 会话**提供语音输入与结果朗读的独立插件，支持 macOS 终端和桌面端。
 
-**当前插件版本：0.1.5。** 正式桌面兼容性已在 StepCode **0.2.0（0.2.0.632）** 上验证：使用命令和壳内选择弹窗，不修改 `StepCode.app`，不另起编码 Agent。
+**当前插件版本：0.1.6。** 正式桌面兼容性已在 StepCode **0.2.1（0.2.1.639）** 上验证：使用命令和壳内选择弹窗，不修改 `StepCode.app`，不另起编码 Agent。
 
 | 运行环境 | 界面与接入方式 |
 | --- | --- |
 | macOS 终端 | TUI 面板、字幕、电平与快捷键 |
-| 正式 StepCode 桌面端 | `/voice panel` 打开选择弹窗；状态与字幕通过“刷新状态”查看 |
+| 正式 StepCode 桌面端 | `/stepvoice` 打开选择弹窗；状态与字幕通过“刷新状态”查看 |
 | 带 Voice v1 补丁的开发宿主 | 可选进程内接入；不是正式版已具备的能力 |
 
 **普通插件不提供常驻桌面侧栏。** 独立测试副本中的常驻 UI 依赖宿主改动，不随此仓库安装。当前版本的自动化检查不替代真实麦克风、中文识别和线上 TTS 验收。
+
+**0.1.6 命令迁移：** 入口从 `/voice` 改为 **`/stepvoice`**，旧命令不再注册，所有子命令保留。更新插件后请重启 StepCode；仍加载 0.1.5 的进程不会自动获得新入口。
 
 ## 主要功能
 
@@ -25,7 +27,7 @@ Step Voice 是为**当前 StepCode 会话**提供语音输入与结果朗读的�
 - **宿主级接入（开发版）**：支持 Voice v1 的宿主统一管理语音会话、转写接收和任务关联；旧宿主保留兼容插件路径。详见 [Harness 接入说明](HARNESS_INTEGRATION.md)。
 - **状态反馈**：显示电平、提交/排队状态和错误。当前直送模式丢弃 Realtime 模型自己的回复事件，结果播报走宿主输出后的独立 TTS。
 
-**停顿就是提交边界**（默认 VAD 静音阈值 450 ms），请一次说完一条指令。需要暂停输入时用 `/voice mute`；取消编码任务和权限确认使用 StepCode 主界面的原有操作，终端可用 Ctrl+G。
+**停顿就是提交边界**（默认 VAD 静音阈值 450 ms），请一次说完一条指令。需要暂停输入时用 `/stepvoice mute`；取消编码任务和权限确认使用 StepCode 主界面的原有操作，终端可用 Ctrl+G。
 
 ## 快速开始：正式 macOS 桌面版
 
@@ -37,10 +39,10 @@ step install git:github.com/Zgh332358/StepFun-Voice
 ```
 
 1. 保存当前工作，退出并重新打开正式 StepCode。
-2. 在聊天输入框发送 **`/voice panel`**，打开语音控制弹窗；此时不会录音或调用语音模型。
-3. 首次接入运行 **`/voice setup`**，选择通道，并在 macOS 隐藏输入框中输入 Key。不要把 Key 发到聊天里；此步骤会在线验证，可能消耗额度。
-4. 主动选择“开始语音”或发送 `/voice start`，按系统提示授权麦克风。
-5. 用 `/voice mute` 暂停输入、`/voice interrupt` 打断朗读、`/voice end` 结束通话。
+2. 在聊天输入框发送 **`/stepvoice`**，打开语音控制弹窗；此时不会录音或调用语音模型。
+3. 首次接入运行 **`/stepvoice setup`**，选择通道，并在 macOS 隐藏输入框中输入 Key。不要把 Key 发到聊天里；此步骤会在线验证，可能消耗额度。
+4. 主动选择“开始语音”或发送 `/stepvoice start`，按系统提示授权麦克风。
+5. 用 `/stepvoice mute` 暂停输入、`/stepvoice interrupt` 打断朗读、`/stepvoice end` 结束通话。
 
 只想在一个项目使用时，在该项目目录安装并添加 `-l`。如果已经通过本地目录安装，先用 `step list` 确认来源，不要再装一份相同插件；更新方式见[管理安装](#管理安装)。
 
@@ -76,7 +78,7 @@ flowchart TB
 
 | 文件 | 职责 |
 | --- | --- |
-| `index.ts` | 能力探测、宿主 provider 注册、`/voice` 终端/桌面兼容入口与资源回收 |
+| `index.ts` | 能力探测、宿主 provider 注册、`/stepvoice` 终端/桌面兼容入口与资源回收 |
 | `src/harness-provider.mjs` | 新宿主模式：StepFun 协议、接入配置、摘要和 TTS，无任务执行入口 |
 | `src/harness-transport.mjs` | 新宿主模式：进程内 UI 适配，不重复提交最终转写 |
 | `src/terminal-ui.ts` | 终端面板：字幕、电平表、任务预览、按键处理 |
@@ -106,13 +108,13 @@ step install -l git:github.com/Zgh332358/StepFun-Voice
 step
 ```
 
-然后输入 `/voice panel`。桌面用户按上面的快速开始操作；以下快捷键说明适用于终端 TUI 的首次接入：
+然后输入 `/stepvoice`。桌面用户按上面的快速开始操作；以下快捷键说明适用于终端 TUI 的首次接入：
 
 1. 选择接入通道：**开放平台 API**（按调用量计费）或 **Step Plan**（使用订阅套餐额度）。
 2. 粘贴 API Key（输入时只显示最后 4 位）。两个通道用同一把平台 Key，在 [platform.stepfun.com/interface-key](https://platform.stepfun.com/interface-key) 创建；Step Plan 通道需要账号已[订阅套餐](https://platform.stepfun.com/step-plan)。
 3. 插件当场验证：先确认 Key 被该通道接受，再确认该通道的实时语音模型能建立会话。通过后保存，按 Enter 开始语音。
 
-如果启动前已经 `export STEP_API_KEY`，第 2 步直接按 Enter 就会使用它，不会另存一份。之后可在面板按 Ctrl+O → K 更换通道或 Key，或运行 `/voice setup`。Step Code 会 clone 仓库、安装运行依赖并注册扩展。安装仅注册插件，麦克风在用户明确开始语音后启用。
+如果启动前已经 `export STEP_API_KEY`，第 2 步直接按 Enter 就会使用它，不会另存一份。之后可在面板按 Ctrl+O → K 更换通道或 Key，或运行 `/stepvoice setup`。Step Code 会 clone 仓库、安装运行依赖并注册扩展。安装仅注册插件，麦克风在用户明确开始语音后启用。
 
 ### 两个接入通道
 
@@ -136,7 +138,7 @@ step
 | 结果总结（文本模型） | `step-3.7-flash` | `STEP_VOICE_SUMMARY_MODEL` |
 | 语音音色 | `linjiajiejie` | `STEP_VOICE_VOICE` |
 
-要覆盖默认模型或音色，用 `export STEP_VOICE_REALTIME_MODEL=...` 等变量设置你 StepFun 账号可用的模型或音色，再从**同一个终端**运行 `step`。如果 Step Code 已经运行，先退出，再设置变量并重新启动；在另一个终端执行 `export` 不会更新已有进程。启动后用 `/voice config`，或在语音面板按 Ctrl+O，查看当前配置。
+要覆盖默认模型或音色，用 `export STEP_VOICE_REALTIME_MODEL=...` 等变量设置你 StepFun 账号可用的模型或音色，再从**同一个终端**运行 `step`。如果 Step Code 已经运行，先退出，再设置变量并重新启动；在另一个终端执行 `export` 不会更新已有进程。启动后用 `/stepvoice config`，或在语音面板按 Ctrl+O，查看当前配置。
 
 编码与文件、终端任务沿用 **Step Code 当前选择的模型**，不由这些语音变量指定。代码还提供默认型号为 `stepaudio-3-asr-max` 的独立 ASR helper，可通过 `STEP_VOICE_ASR_MODEL` 修改；当前通话的理解和字幕由 Realtime 完成，不使用这个独立 ASR 路径。
 
@@ -170,7 +172,7 @@ npm ci --ignore-scripts
 step --no-extensions -e ./index.ts
 ```
 
-进入终端后运行 `/voice setup` 配置接入，再用 `/voice panel` 打开面板。输入框为空时按 Enter 才开始语音；也可运行 `/voice start`。不要在命令消息中传入 Key。
+进入终端后运行 `/stepvoice setup` 配置接入，再用 `/stepvoice` 打开面板。输入框为空时按 Enter 才开始语音；也可运行 `/stepvoice start`。不要在命令消息中传入 Key。
 
 需要让正式桌面版加载这个源码目录时，先确认没有重复安装，再执行 `step install /absolute/path/to/StepFun-Voice`，随后重启桌面应用。
 
@@ -203,19 +205,19 @@ node scripts/package-plugin.mjs
 
 ### 使用
 
-正式版兼容包 `0.1.5` 使用现有扩展 API，不修改 StepCode.app，也不提供测试副本的常驻面板。安装、更新及验证范围见 [正式桌面版使用说明](FORMAL_DESKTOP.md)。
+正式版兼容包 `0.1.6` 使用现有扩展 API，不修改 StepCode.app，也不提供测试副本的常驻面板。安装、更新及验证范围见 [正式桌面版使用说明](FORMAL_DESKTOP.md)。
 
-1. 在桌面聊天输入框发送 `/voice panel` 打开语音控制弹窗，**不会开始录音**。该明确参数入口避免裸 `/voice` 被同名技能补全；`/voice` 仍然可用。
+1. 在桌面聊天输入框发送 **`/stepvoice`** 打开语音控制弹窗，**不会开始录音**。`/stepvoice panel` 与它同效；新入口避开旧 `/voice` 与 `Voice Of Customer Miner` 的补全冲突。
 2. 弹窗选项：
    - **开始语音**：启动本机麦克风（首次按 macOS 提示授权）；停顿后最终转写直接提交当前任务，忙时排队。
    - **静音/恢复麦克风**、**打断朗读/语音回复**、**结束通话**、**刷新状态**、**接入设置**、**关闭（结束通话）**。
 3. 弹窗内显示语音状态、接入通道、Key 状态、当前任务状态与最近字幕/输出摘要；选择“刷新状态”更新。
-4. `/voice start|mute|interrupt|end|stop|status|config` 仍可直接执行，适合通话中宿主正在运行时快速控制。
-5. 宿主开始任务或出现权限/交互提示时，语音弹窗自动让出焦点；通话保持进行，重新发送 `/voice` 可回到控制。工具权限确认始终在 StepCode 处理，插件不代为批准。
+4. `/stepvoice start|mute|interrupt|end|stop|status|config` 仍可直接执行，适合通话中宿主正在运行时快速控制。
+5. 宿主开始任务或出现权限/交互提示时，语音弹窗自动让出焦点；通话保持进行，重新发送 `/stepvoice` 可回到控制。工具权限确认始终在 StepCode 处理，插件不代为批准。
 
 ### 接入设置（无浏览器页面）
 
-`/voice setup` 在壳内弹窗中完成：选择通道（开放平台 API / Step Plan）→ 选择 Key 来源（粘贴输入 / 环境变量 / 保留 / 清除）→ 实时验证后保存。桌面宿主没有密码输入框，“粘贴输入”调用 macOS 系统隐藏输入框（osascript hidden answer），Key 不进入聊天内容、模型上下文或命令日志。保存位置与终端一致：`~/.stepcode/step-voice/credentials.json`（仅当前用户可读）。
+`/stepvoice setup` 在壳内弹窗中完成：选择通道（开放平台 API / Step Plan）→ 选择 Key 来源（粘贴输入 / 环境变量 / 保留 / 清除）→ 实时验证后保存。桌面宿主没有密码输入框，“粘贴输入”调用 macOS 系统隐藏输入框（osascript hidden answer），Key 不进入聊天内容、模型上下文或命令日志。保存位置与终端一致：`~/.stepcode/step-voice/credentials.json`（仅当前用户可读）。
 
 ### 边界
 
@@ -227,15 +229,15 @@ node scripts/package-plugin.mjs
 
 | 命令 | 用途 |
 | --- | --- |
-| `/voice` / `/voice panel` | 打开语音面板；后台 Agent 工作时显示终端语音状态控件 |
-| `/voice start` | 开始语音，申请本机麦克风访问 |
-| `/voice mute` | 切换麦克风静音 |
-| `/voice interrupt` | 清空本地播放队列（含打断朗读）；不取消上游转写，也不停止编码任务 |
-| `/voice end` | 结束通话并关闭麦克风，保留本地语音服务 |
-| `/voice stop` | 释放语音控制器与本地服务 |
-| `/voice status` | 查看语音和宿主任务状态 |
-| `/voice setup` | 打开接入引导：选择通道、输入并验证 API Key |
-| `/voice config` | 显示接入说明 |
+| `/stepvoice` / `/stepvoice panel` | 打开语音面板；后台 Agent 工作时显示终端语音状态控件 |
+| `/stepvoice start` | 开始语音，申请本机麦克风访问 |
+| `/stepvoice mute` | 切换麦克风静音 |
+| `/stepvoice interrupt` | 清空本地播放队列（含打断朗读）；不取消上游转写，也不停止编码任务 |
+| `/stepvoice end` | 结束通话并关闭麦克风，保留本地语音服务 |
+| `/stepvoice stop` | 释放语音控制器与本地服务 |
+| `/stepvoice status` | 查看语音和宿主任务状态 |
+| `/stepvoice setup` | 打开接入引导：选择通道、输入并验证 API Key |
+| `/stepvoice config` | 显示接入说明 |
 
 在语音面板中：
 
@@ -254,7 +256,7 @@ node scripts/package-plugin.mjs
 
 面板下方的输入框始终可用，字母和中文输入法的文字都会进入输入框。无论通话是否开启，文字都发给 Step Code；没有“发给语音模型”的模式。设置视图中的 R 重新读取**当前进程**已有的 Key、API 地址和模型变量，需先结束通话。VAD 和其他参数改动需重新启动 Step Code。
 
-当后台编码任务开始时，完整语音面板会收起，麦克风与通话按当前状态继续运行，终端保留语音状态控件。这使宿主的权限确认和其他交互继续获得键盘焦点。可继续说话，或使用 `/voice mute`、`/voice interrupt`、`/voice end` 控制通话；任务结束后通过 `/voice` 重新打开完整面板。
+当后台编码任务开始时，完整语音面板会收起，麦克风与通话按当前状态继续运行，终端保留语音状态控件。这使宿主的权限确认和其他交互继续获得键盘焦点。可继续说话，或使用 `/stepvoice mute`、`/stepvoice interrupt`、`/stepvoice end` 控制通话；任务结束后通过 `/stepvoice` 重新打开完整面板。
 
 ## 环境变量与 StepFun 模型
 
@@ -334,7 +336,7 @@ Key 有两个来源：
 
 ### 修改源码后生效
 
-修改源码不会热更新已加载模块。先用 `/voice end` 结束录音，待宿主任务稳定后手动 `/reload`，或退出再启动 Step Code。Swift 助手按源码摘要自动重新编译。若同时有项目和全局安装，确认重载的是所修改的项目副本；不要执行更新命令覆盖本地变更。
+修改源码不会热更新已加载模块。先用 `/stepvoice end` 结束录音，待宿主任务稳定后手动 `/reload`，或退出再启动 Step Code。Swift 助手按源码摘要自动重新编译。若同时有项目和全局安装，确认重载的是所修改的项目副本；不要执行更新命令覆盖本地变更。
 
 宿主的 `sendUserMessage` 返回 `void`，因此“已提交 / 已排队”只表示已尝试交给宿主，不是执行成功确认。插件在 45 秒未观察到开始、且宿主没有运行任务或等待交互时，显示无启动错误；排队时继续等待当前工作/权限结束。同步提交异常会清除本次关联，**接受结果不确定时不补发、不自动重试**。请先核对主终端的用户消息、队列、模型/登录错误，再决定是否重新输入。
 
@@ -357,7 +359,9 @@ node --import ./test/offline-network.mjs --test test/desktop-dialog.test.mjs
 STEP_VOICE_PACKAGE="$PWD" node scripts/formal-desktop-smoke.mjs
 ```
 
-桌面 UI 检查需要本机安装 StepCode 0.2.0 和 CLI，使用临时 HOME、占位模型声明和网络保护，不使用真实账号，也不申请麦克风权限。默认程序位置是 `/Applications/StepCode.app`，可用 `STEP_CODE_APP`、`STEP_CODE_CLI` 指定其他位置。它会打开并关闭一个独立测试窗口，不重启你的工作窗口。
+桌面 UI 检查需要本机安装 StepCode 和 CLI，本次在 **0.2.1** 上验证。脚本使用临时 HOME、占位模型声明、补全冲突技能样本和网络保护，不使用真实账号，也不申请麦克风权限。默认程序位置是 `/Applications/StepCode.app`，可用 `STEP_CODE_APP`、`STEP_CODE_CLI` 指定其他位置。它会打开并关闭一个独立测试窗口，不重启你的工作窗口。
+
+如果宿主包没有附带 Playwright（例如 0.2.1），仅测试时通过 `STEP_PLAYWRIGHT_MODULE=/absolute/path/to/playwright-core/index.mjs` 指向已安装的测试驱动；插件正常使用不需要 Playwright。
 
 ### 可选 Voice v1 开发宿主验证
 
@@ -371,13 +375,13 @@ STEP_CODE_VOICE_SOURCE=/path/to/patched-Step-Code npm run check:types
 
 未设置 `STEP_CODE_VOICE_SOURCE` 时，3 项新宿主构建产物测试明确跳过；未设置 `STEP_CODE_HOST` 时，2 项正式桌面宿主测试明确跳过。这些条件不能与“全部通过”混为一谈。Voice v1 补丁不包含在普通插件安装中，详见 [Harness 接入说明](HARNESS_INTEGRATION.md)。
 
-### 0.1.5 验证记录（2026-11-01）
+### 0.1.6 验证记录（2026-11-01）
 
 | 检查 | 结果与前提 |
 | --- | --- |
-| 完整自动化套件 | **174 通过、0 失败、0 跳过**；同时提供正式桌面模块与配套 Voice v1 源码 |
-| 最终安装目录的正式宿主检查 | **2 项通过**；真实发现/加载、命令分发、选择 broker 与前端补全 |
-| 未修改的正式桌面程序 UI 检查 | **5 项通过**；独立测试配置中实际输入 `/voice panel`，查看弹窗并截图 |
+| 完整自动化套件 | **175 通过、0 失败、0 跳过**；同时提供正式桌面模块与配套 Voice v1 源码 |
+| 当前源码的正式宿主检查 | **2 项通过**；真实发现/加载、命令分发、选择 broker 与前端补全 |
+| 未修改的正式桌面程序 UI 检查 | **6 项通过**；先观察旧技能候选，再实际发送裸 `/stepvoice` 并查看弹窗截图 |
 | TypeScript | 配套宿主公开类型下通过 |
 | Swift `--self-test` | 离线 PCM 转换通过，`permissionRequested: false`；不测试真实录音 |
 
@@ -387,12 +391,12 @@ STEP_CODE_VOICE_SOURCE=/path/to/patched-Step-Code npm run check:types
 
 ## 边界与限制
 
-- 本 `main` 分支只提供 macOS 原生音频；Windows 版本位于独立 `windows` 分支，本次 0.1.5 桌面兼容改动未同步到该分支。Linux 不在本次支持范围。
+- 本 `main` 分支只提供 macOS 原生音频；Windows 版本位于独立 `windows` 分支，本次 0.1.6 桌面兼容改动未同步到该分支。Linux 不在本次支持范围。
 - 实际延迟、中文识别、音色效果、扬声器回声表现，需要在配置 Key 的 macOS 设备上验证。VAD 由 StepFun 服务端判定，网络延迟与录音环境会影响打断速度。
 - 总结模型 `step-3.7-flash` 为思考型模型，朗读前有几秒总结延迟；若账号无此模型，朗读自动回退为结尾截断并在面板提示。
 - 国内和海外 API 的账号、Key、模型可用性需要分别核实，插件不会自动跨地区发送 Key。服务与型号变化时，以 StepFun 当前文档为准。
 
-如果本地控制连接失败，执行 `/voice stop` 后再 `/voice`，重建控制器。麦克风被拒绝时，在 macOS 系统设置中允许当前终端应用使用麦克风，再重新开始。缺少 Key 时会显示环境变量说明；Key、模型权限和接口错误在终端呈现。
+如果本地控制连接失败，执行 `/stepvoice stop` 后再 `/stepvoice`，重建控制器。麦克风被拒绝时，在 macOS 系统设置中允许当前终端应用使用麦克风，再重新开始。缺少 Key 时会显示环境变量说明；Key、模型权限和接口错误在终端呈现。
 
 ## 官方资料
 

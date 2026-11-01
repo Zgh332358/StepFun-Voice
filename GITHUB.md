@@ -1,6 +1,6 @@
 # GitHub 分发与安装
 
-插件源码仓库：[Zgh332358/StepFun-Voice](https://github.com/Zgh332358/StepFun-Voice)。`main` 是 macOS 分支；普通插件不修改正式 `StepCode.app`，桌面入口为 `/voice panel`，不是常驻侧栏。
+插件源码仓库：[Zgh332358/StepFun-Voice](https://github.com/Zgh332358/StepFun-Voice)。`main` 是 macOS 分支；普通插件不修改正式 `StepCode.app`，桌面入口为 `/stepvoice`，不是常驻侧栏。
 
 ## 从 GitHub 安装
 
@@ -14,7 +14,7 @@ step install git:github.com/Zgh332358/StepFun-Voice
 step install -l git:github.com/Zgh332358/StepFun-Voice
 ```
 
-二选一即可。安装后保存工作并重启 StepCode，然后发送 `/voice panel`。需要接入设置时用 `/voice setup`，不要把 Key 发到聊天里。打开弹窗不会录音；开始通话和在线验证均由你主动触发。
+二选一即可。安装后保存工作并重启 StepCode，然后发送 `/stepvoice`。需要接入设置时用 `/stepvoice setup`，不要把 Key 发到聊天里。打开弹窗不会录音；开始通话和在线验证均由你主动触发。
 
 宿主负责下载仓库、安装 `ws` 运行依赖和保存扩展引用。`pi.extensions` 中的 `./index.ts` 是真实加载入口。无需 npm 账号；仓库的 `private: true` 防止误发 npm。
 

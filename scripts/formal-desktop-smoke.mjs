@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -9,12 +9,17 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
 const application = resolve(process.env.STEP_CODE_APP || '/Applications/StepCode.app');
 const hostModules = join(application, 'Contents/Resources/server/node_modules');
-const { _electron } = await import(pathToFileURL(join(hostModules, 'playwright-core/index.mjs')).href);
+const playwrightModule = resolve(process.env.STEP_PLAYWRIGHT_MODULE || join(hostModules, 'playwright-core/index.mjs'));
+if (!existsSync(playwrightModule)) throw new Error('Desktop QA needs playwright-core. Set STEP_PLAYWRIGHT_MODULE to its installed index.mjs; the voice plugin itself does not need it.');
+const { _electron } = await import(pathToFileURL(playwrightModule).href);
 const plugin = resolve(process.env.STEP_VOICE_PACKAGE || JSON.parse(readFileSync(join(root, `.cache/releases/step-voice-${version}-manifest.json`), 'utf8')).directory);
 mkdirSync(join(root, '.cache/releases'), { recursive: true });
 const profile = mkdtempSync(join(root, '.cache/formal-ui-'));
 const home = join(profile, 'home'), workspace = join(profile, 'workspace');
 for (const path of [home, workspace, join(home, '.stepcode/agent'), join(profile, 'tmp')]) mkdirSync(path, { recursive: true });
+const skill = join(home, '.stepcode/agent/skills/voice-of-customer-miner');
+mkdirSync(skill, { recursive: true });
+writeFileSync(join(skill, 'SKILL.md'), '---\nname: voice-of-customer-miner\ndescription: Offline autocomplete collision fixture\n---\nThis skill is only listed during UI testing; it is never executed.\n');
 const wrapper = join(profile, 'offline-server.mjs');
 // The desktop launcher checks public/index.html beside its configured server entry.
 symlinkSync(join(hostModules, '@step-harness/web/dist/public'), join(profile, 'public'));
@@ -31,7 +36,7 @@ const env = { PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/s
 const cli = process.env.STEP_CODE_CLI || join(homedir(), '.stepcode/bin/step');
 execFileSync(cli, ['install', plugin], { cwd: workspace, env, stdio: 'pipe' });
 const app = await _electron.launch({ executablePath: join(application, 'Contents/MacOS/StepCode'), cwd: workspace, env, timeout: 30000 });
-const result = { plugin, checks: [], errors: [] };
+const result = { plugin, hostVersion: await app.evaluate(({ app }) => app.getVersion()), checks: [], errors: [] };
 try {
   await app.evaluate(({ session }) => {
     session.defaultSession.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] }, (details, done) => {
@@ -49,7 +54,10 @@ try {
   await page.getByText('离线界面验证（不发请求）', { exact: false }).waitFor();
   await page.getByRole('button', { name: '新建会话', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('#sendButton')?.disabled === false);
-  await page.locator('#prompt').fill('/voice panel');
+  await page.locator('#prompt').fill('/voice');
+  await page.getByRole('option').filter({ hasText: 'Voice Of Customer Miner' }).waitFor({ timeout: 15000 });
+  await page.locator('#prompt').fill('/stepvoice');
+  await page.locator('.slash-item').waitFor({ state: 'hidden' });
   await page.locator('#prompt').press('Enter');
   await page.getByText('Step Voice · 当前桌面会话', { exact: false }).waitFor({ timeout: 15000 });
   const snapshot = await page.locator('body').ariaSnapshot();
@@ -58,7 +66,7 @@ try {
   assert.equal(app.windows().length, 1);
   assert.equal(result.errors.length, 0);
   await page.screenshot({ path: join(root, '.cache/releases/formal-desktop-plugin.png') });
-  result.checks.push('unmodified official 0.2.0 executable', 'isolated profile package discovery', 'actual typed /voice panel opens a native host dialog', 'missing-Key setup visible', 'one window and no renderer error');
+  result.checks.push('unmodified official desktop executable', 'isolated profile package discovery', 'bare /stepvoice excludes the observed Voice Of Customer Miner candidate', 'actual typed /stepvoice opens a native host dialog', 'missing-Key setup visible', 'one window and no renderer error');
   writeFileSync(join(profile, 'dialog-snapshot.txt'), snapshot);
 } catch (error) {
   result.failure = error.message;
