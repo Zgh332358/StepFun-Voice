@@ -88,8 +88,13 @@ interface VoiceSocket {
 interface VoiceSocketConstructor {
 	new (url: string, protocols: string[], options: { headers: Record<string, string> }): VoiceSocket;
 }
+export interface VoiceTransport extends VoiceSocket {
+	open(): void;
+}
 export interface TerminalVoiceControllerOptions {
-	url: string;
+	url?: string;
+	/** A session-owned in-process channel; legacy hosts continue to use the authenticated local relay. */
+	transport?: VoiceTransport;
 	audioFactory?: (callbacks: NativeAudioCallbacks) => NativeAudioAdapter | Promise<NativeAudioAdapter>;
 	WebSocketImpl?: VoiceSocketConstructor;
 	connectTimeoutMs?: number;
@@ -101,6 +106,7 @@ export interface NormalizedVoiceEvent {
 	type: string;
 	voiceSessionId?: string;
 	state?: VoiceState;
+	muted?: boolean;
 	config?: Partial<TerminalVoiceConfig>;
 	agentConnected?: boolean;
 	agent?: AgentSnapshot;
@@ -125,7 +131,7 @@ export interface NormalizedVoiceEvent {
 type NormalizedEvent = NormalizedVoiceEvent;
 type SnapshotListener = (snapshot: TerminalVoiceSnapshot, event?: NormalizedEvent) => void;
 
-const ENV_HELP = "还没有配置 API Key。在语音面板按 Enter 按引导选择通道并输入 Key；也可以在启动 Step Code 前 export STEP_API_KEY。";
+const ENV_HELP = "还没有配置 API Key。请运行 /voice setup，按引导选择通道并输入 Key；也可以在启动 Step Code 前 export STEP_API_KEY。";
 const MAX_HISTORY = 100;
 const MAX_TEXT = 12_000;
 const DefaultWebSocket = createRequire(import.meta.url)("ws") as VoiceSocketConstructor;
@@ -316,12 +322,15 @@ export class TerminalVoiceController {
 		this.connectPromise = new Promise<void>((resolve, reject) => {
 			this.connectedResolve = resolve; this.connectedReject = reject;
 			try {
-				const url = new URL(this.options.url);
-				if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.username || url.password) throw new Error("语音控制器只接受插件生成的本机服务地址。");
-				const token = new URLSearchParams(url.hash.slice(1)).get("token") || url.hash.slice(1);
-				if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("本地语音连接凭证无效，请重新运行 /voice。");
-				const Socket = this.options.WebSocketImpl || DefaultWebSocket;
-				this.socket = new Socket(`ws://${url.host}/ws`, ["step-voice", token], { headers: { Origin: url.origin } });
+				if (this.options.transport) this.socket = this.options.transport;
+				else {
+					const url = new URL(this.options.url || "");
+					if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.username || url.password) throw new Error("语音控制器只接受插件生成的本机服务地址。");
+					const token = new URLSearchParams(url.hash.slice(1)).get("token") || url.hash.slice(1);
+					if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("本地语音连接凭证无效，请重新运行 /voice。");
+					const Socket = this.options.WebSocketImpl || DefaultWebSocket;
+					this.socket = new Socket(`ws://${url.host}/ws`, ["step-voice", token], { headers: { Origin: url.origin } });
+				}
 				this.socket.on("message", (data: unknown) => {
 					try { this.handleEvent(JSON.parse(String(data))); }
 					catch (error) { this.notice(`本地语音消息读取失败：${errorText(error)}`, "error"); }
@@ -338,6 +347,7 @@ export class TerminalVoiceController {
 				this.connectTimer = setTimeout(() => {
 					this.failConnection(new Error("本地语音服务连接超时，请重新运行 /voice。")); this.socket?.close();
 				}, this.options.connectTimeoutMs ?? 8000);
+				this.options.transport?.open();
 			} catch (error) { this.failConnection(new Error(errorText(error))); }
 		});
 		// Callers may await this promise; keep an internal handler for terminal teardown races.
@@ -409,7 +419,7 @@ export class TerminalVoiceController {
 			if (generation !== this.audioGeneration || this.disposed) return;
 			this.finishStartupGate(gate);
 			this.state.startupPhase = "connecting-model";
-			this.send({ type: "voice.start", voiceSessionId });
+			this.send({ type: "voice.start", voiceSessionId, ...(this.options.transport ? { muted: this.state.muted } : {}) });
 			if (generation === this.audioGeneration && this.state.voice === "connecting") {
 				clearTimeout(this.modelReadyTimer);
 				this.modelReadyTimer = setTimeout(() => {
@@ -431,7 +441,9 @@ export class TerminalVoiceController {
 	setMuted(value: boolean): void {
 		if (this.state.voice !== "ready" && this.state.voice !== "connecting") return;
 		this.state.muted = Boolean(value); this.state.micLevel = 0;
-		this.audio?.setMuted(this.state.muted || this.ducked); this.emit();
+		this.audio?.setMuted(this.state.muted || this.ducked);
+		if (this.options.transport && this.voiceSessionId) this.send({ type: "voice.mute", voiceSessionId: this.voiceSessionId, muted: this.state.muted });
+		this.emit();
 	}
 	mute(value = !this.state.muted): void { this.setMuted(value); }
 	interrupt(): void {
@@ -553,6 +565,10 @@ export class TerminalVoiceController {
 			}
 			case "config.saved": this.applyPublicConfig(event.config); this.state.notice = { kind: "info", text: "已重新读取环境变量。点击开始语音即可连接。" }; break;
 			case "voice.state":
+				if (this.options.transport && typeof event.muted === "boolean" && (event.state === "ready" || event.state === "connecting")) {
+					this.state.muted = event.muted;
+					this.audio?.setMuted(this.state.muted || this.ducked);
+				}
 				if (event.state === "ready" && this.audio && this.state.voice === "connecting") {
 					clearTimeout(this.modelReadyTimer); this.modelReadyTimer = undefined;
 					this.state.voice = "ready"; this.state.startupPhase = "ready";
@@ -571,10 +587,11 @@ export class TerminalVoiceController {
 					this.subtitleAudioMs += bytes / 48;
 					this.updateSubtitleHighlight();
 				}
-				const playable = this.state.voice === "ready" && this.audio && Boolean(event.audio) && bytes > 0 && bytes % 2 === 0;
-				if (playable && this.fence.accept(event.responseId)) {
+				const output = this.audio;
+				const playable = this.state.voice === "ready" && Boolean(event.audio) && bytes > 0 && bytes % 2 === 0;
+				if (playable && output && this.fence.accept(event.responseId)) {
 					this.fence.start(event.responseId);
-					try { this.audio.play(audio, event.sampleRate ?? 24000); }
+					try { output.play(audio, event.sampleRate ?? 24000); }
 					catch (error) { this.notice(`播放语音回复失败：${errorText(error)}`, "error"); }
 				}
 				break;

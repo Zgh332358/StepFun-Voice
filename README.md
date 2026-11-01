@@ -6,42 +6,79 @@
 
 > **本分支（`main`）是 macOS 版**（Swift 音频助手）。Windows 版在 `windows` 分支（C#/WinMM 音频助手），两个分支并存、互不覆盖，安装时 Windows 需加 `@windows` ref。
 
-Step Voice 是可单独加载的 Step Code 终端语音插件，让编码代理拥有 Codex 式的语音工作流：
+Step Voice 是为**当前 StepCode 会话**提供语音输入与结果朗读的独立插件，支持 macOS 终端和桌面端。
+
+**当前插件版本：0.1.5。** 正式桌面兼容性已在 StepCode **0.2.0（0.2.0.632）** 上验证：使用命令和壳内选择弹窗，不修改 `StepCode.app`，不另起编码 Agent。
+
+| 运行环境 | 界面与接入方式 |
+| --- | --- |
+| macOS 终端 | TUI 面板、字幕、电平与快捷键 |
+| 正式 StepCode 桌面端 | `/voice panel` 打开选择弹窗；状态与字幕通过“刷新状态”查看 |
+| 带 Voice v1 补丁的开发宿主 | 可选进程内接入；不是正式版已具备的能力 |
+
+**普通插件不提供常驻桌面侧栏。** 独立测试副本中的常驻 UI 依赖宿主改动，不随此仓库安装。当前版本的自动化检查不替代真实麦克风、中文识别和线上 TTS 验收。
+
+## 主要功能
 
 - **语音直送**：说话 → StepFun Realtime 转写 → 原文直接提交当前 Step Code（忙时 followUp 排队）。不经意图分类、不代替 Step Code 完成任务。
-- **结果朗读**：任务完成后，自动用 LLM 把真实输出总结成 ≤80 字口语化摘要，再用 TTS 以自适应语速朗读，整段控制在播放队列安全范围内；/voice 面板同步显示字幕并随播放进度高亮。
-- **原生语音回复**：Realtime 模型自己的简短语音反馈直接播放，字幕在面板以“Step”显示。
-- **全程可观测**：电平表、提交/排队/错误状态、总结失败原因，全部在面板可见，没有静默失败。
+- **结果朗读**：任务完成后，用 LLM 把真实输出总结成目标 80 字的口语化摘要，再以自适应语速 TTS 朗读；面板显示字幕，高亮目前按接收到的音频长度估算，不是播放器逐字对齐。
+- **宿主级接入（开发版）**：支持 Voice v1 的宿主统一管理语音会话、转写接收和任务关联；旧宿主保留兼容插件路径。详见 [Harness 接入说明](HARNESS_INTEGRATION.md)。
+- **状态反馈**：显示电平、提交/排队状态和错误。当前直送模式丢弃 Realtime 模型自己的回复事件，结果播报走宿主输出后的独立 TTS。
 
-**停顿就是提交边界**（默认 VAD 静音阈值 450 ms），请一次说完一条指令。需要暂停输入时用 `/voice mute`，取消编码任务用 Ctrl+G，权限确认始终在主终端处理。
+**停顿就是提交边界**（默认 VAD 静音阈值 450 ms），请一次说完一条指令。需要暂停输入时用 `/voice mute`；取消编码任务和权限确认使用 StepCode 主界面的原有操作，终端可用 Ctrl+G。
+
+## 快速开始：正式 macOS 桌面版
+
+需要已安装 StepCode、Node.js ≥ 22.19、Git 和 Xcode Command Line Tools。
+
+```bash
+# 安装到用户范围，供正式桌面端和终端使用
+step install git:github.com/Zgh332358/StepFun-Voice
+```
+
+1. 保存当前工作，退出并重新打开正式 StepCode。
+2. 在聊天输入框发送 **`/voice panel`**，打开语音控制弹窗；此时不会录音或调用语音模型。
+3. 首次接入运行 **`/voice setup`**，选择通道，并在 macOS 隐藏输入框中输入 Key。不要把 Key 发到聊天里；此步骤会在线验证，可能消耗额度。
+4. 主动选择“开始语音”或发送 `/voice start`，按系统提示授权麦克风。
+5. 用 `/voice mute` 暂停输入、`/voice interrupt` 打断朗读、`/voice end` 结束通话。
+
+只想在一个项目使用时，在该项目目录安装并添加 `-l`。如果已经通过本地目录安装，先用 `step list` 确认来源，不要再装一份相同插件；更新方式见[管理安装](#管理安装)。
+
+[桌面使用说明](FORMAL_DESKTOP.md) · [安装与启动](#安装与启动) · [环境变量](#环境变量与-stepfun-模型) · [排障](#排障指南) · [测试与验证范围](#测试与验证范围)
 
 ## 技术路径
 
+支持 `ctx.voice.protocolVersion === 1` 时，控制器使用进程内 transport 接入宿主的语音会话服务；顺序、去重、真实接收确认与朗读调度由宿主负责，不启动下面的本地 relay。配套宿主补丁需在独立源码中构建，仅更新插件不会升级已安装应用。
+
+下图是**正式版兼容路径**（终端面板和桌面弹窗共用音频控制器）：
+
 ```mermaid
 flowchart TB
-  subgraph T["终端进程（macOS）"]
+  subgraph T["插件进程（macOS）"]
     MIC["麦克风"] --> SW["Swift 音频助手 native/VoiceAudio.swift\n采集 PCM16 24kHz · 播放 · 电平表 · 3 秒无输入看门狗"]
     SW -- "JSONL：audio / level / playback" --> CTRL["终端控制器 terminal-controller.ts\n状态机 · 播放 fence · 回声 duck · 事件分发"]
-    CTRL --> UI["终端面板 terminal-ui.ts\n字幕 · 电平表 · 任务预览"]
+    CTRL --> UI["终端面板 / 桌面选择弹窗\n字幕 · 电平 · 任务状态"]
   end
   subgraph P["本地插件服务 server.mjs（仅监听 127.0.0.1）"]
     SERVER["relay：鉴权 · 转写顺序与去重 · Key 脱敏 · TTS 调度"]
   end
   CTRL -- "WebSocket（随机令牌校验）" --> SERVER
-  SERVER -- "Realtime WS" --> SF["StepFun Realtime\nstepaudio-3-realtime-preview\n输入转写 + 原生语音回复"]
+  SERVER -- "Realtime WS" --> SF["StepFun Realtime\nstepaudio-3-realtime-preview\n输入转写（模型回复本地丢弃）"]
   SERVER -- "chat/completions" --> LLM["总结模型\nstep-3.7-flash\n结果压缩到 80 字"]
   SERVER -- "audio/speech（speed 自适应）" --> TTS["TTS\nstepaudio-3-tts\n朗读任务结果"]
   SERVER -- "最终转写 → sendUserMessage（followUp）" --> HOST["Step Code 宿主\n权限 · 工具 · 当前模型"]
   HOST -- "agent 事件（文本/状态/完成）" --> SERVER
 ```
 
-播报链路（任务完成后触发）：宿主输出 → LLM 总结（失败自动回退为结尾 100 字截断）→ 面板立即显示将朗读的全文字幕 → TTS 合成（超标准时长自动提速，最高 2 倍）→ 本地播放，已读字幕随播放进度高亮（音频字节时钟 × 自适应语速）。播放期间麦克风自动静音防止外放回声循环；`STEP_VOICE_ECHO_CANCEL=1` 时保持麦克风开启以支持语音打断。
+播报链路（任务完成后触发）：宿主输出 → LLM 总结（失败自动回退为结尾 100 字截断）→ 面板立即显示将朗读的全文字幕 → TTS 合成（超标准时长自动提速，最高 2 倍）→ 本地播放，字幕高亮按收到的音频字节数和估算语速推进，可能领先实际播放。播放期间麦克风自动静音防止外放回声循环；`STEP_VOICE_ECHO_CANCEL=1` 时保持麦克风开启以支持语音打断。
 
 ### 模块职责
 
 | 文件 | 职责 |
 | --- | --- |
-| `index.ts` | 插件入口：注册 `/voice` 命令与扩展生命周期 |
+| `index.ts` | 能力探测、宿主 provider 注册、`/voice` 终端/桌面兼容入口与资源回收 |
+| `src/harness-provider.mjs` | 新宿主模式：StepFun 协议、接入配置、摘要和 TTS，无任务执行入口 |
+| `src/harness-transport.mjs` | 新宿主模式：进程内 UI 适配，不重复提交最终转写 |
 | `src/terminal-ui.ts` | 终端面板：字幕、电平表、任务预览、按键处理 |
 | `src/terminal-controller.ts` | 语音控制器：状态机、音频适配器、播放 fence、回声 duck、事件分发、TTS 朗读字幕时钟 |
 | `src/server.mjs` | 本地 relay（仅 127.0.0.1）：鉴权、转写顺序/去重、TTS 朗读与总结调度 |
@@ -69,7 +106,7 @@ step install -l git:github.com/Zgh332358/StepFun-Voice
 step
 ```
 
-然后输入 `/voice`。**第一次打开时面板会引导你完成接入**：
+然后输入 `/voice panel`。桌面用户按上面的快速开始操作；以下快捷键说明适用于终端 TUI 的首次接入：
 
 1. 选择接入通道：**开放平台 API**（按调用量计费）或 **Step Plan**（使用订阅套餐额度）。
 2. 粘贴 API Key（输入时只显示最后 4 位）。两个通道用同一把平台 Key，在 [platform.stepfun.com/interface-key](https://platform.stepfun.com/interface-key) 创建；Step Plan 通道需要账号已[订阅套餐](https://platform.stepfun.com/step-plan)。
@@ -94,7 +131,7 @@ step
 
 | 配置项 | 默认值 | 环境变量 |
 | --- | --- | --- |
-| Realtime 转写 + 原生语音回复 | `stepaudio-3-realtime-preview` | `STEP_VOICE_REALTIME_MODEL` |
+| Realtime 输入转写 | `stepaudio-3-realtime-preview` | `STEP_VOICE_REALTIME_MODEL` |
 | 任务结果朗读（TTS） | `stepaudio-3-tts` | `STEP_VOICE_TTS_MODEL` |
 | 结果总结（文本模型） | `step-3.7-flash` | `STEP_VOICE_SUMMARY_MODEL` |
 | 语音音色 | `linjiajiejie` | `STEP_VOICE_VOICE` |
@@ -109,58 +146,88 @@ step
 
 ```bash
 step list
-step update --extension git:github.com/Zgh332358/StepFun-Voice
-step remove -l git:github.com/Zgh332358/StepFun-Voice
-# 用户范围卸载：step remove git:github.com/Zgh332358/StepFun-Voice
+step update git:github.com/Zgh332358/StepFun-Voice
+step remove git:github.com/Zgh332358/StepFun-Voice
+# 若原来使用 -l 安装，卸载也添加 -l
 ```
 
-`update` 按仓库匹配用户和当前项目中的已配置来源，不使用 `-l`。不固定 ref 时跟随当前跟踪分支。要固定版本，在仓库确实创建了对应 tag 后，使用 `step install -l git:github.com/Zgh332358/StepFun-Voice@v0.1.0`；升级时重新安装新的 tag。
+`update` 按已配置的仓库来源更新；不固定 ref 时跟随该来源的分支。需要固定版本时，先确认目标 tag 或提交确实存在，再在 Git 来源后添加 `@<ref>`。`package.json` 中的版本号不等于已经创建了同名 Git tag。
+
+**本地安装与 GitHub 安装不是同一个来源。** 如果 `step list` 显示本地目录，请保留旧目录备份后再决定是更新本地文件，还是移除该本地来源并安装 GitHub 来源；不要直接叠加两份 Step Voice。更新前先结束通话，更新后重启正式桌面应用。
 
 本插件没有 npm 发布配置、scope 设置或 npx 安装器；`package.json` 标记为 `private`。依赖安装仍由 Step Code 的 Node package 工具处理，这是插件运行需要的 `ws` 依赖。无需在 npm 注册或发布插件。
 
-### 从源码启动
+### 从本仓库源码启动
 
-在仓库根目录执行：
-
-```bash
-pnpm install --frozen-lockfile
-npm --prefix plugins/step-voice ci --ignore-scripts
-
-# 在启动 Step Code 的同一个终端设置开放平台 Key。
-export STEP_API_KEY='你的 StepFun API Key'
-
-pnpm step -e ./plugins/step-voice/index.ts
-```
-
-进入 Step Code 后输入 `/voice`，终端会显示语音面板。输入框为空时按 **Enter** 开始语音，按 macOS 提示允许当前终端应用使用麦克风，即可直接说话。只打开面板不会开启麦克风。也可以输入 `/voice start` 直接开始通话。
-
-仓库根目录还提供 `启动 Step Voice.command`。设置 Key 后，可在同一个终端运行：
+本仓库是独立插件，不包含 StepCode 的 monorepo、`plugins/step-voice` 目录或 pnpm 锁文件。使用已安装的 `step` 命令：
 
 ```bash
-"./启动 Step Voice.command"
+git clone https://github.com/Zgh332358/StepFun-Voice.git
+cd StepFun-Voice
+npm ci --ignore-scripts
+
+# 仅在这个开发进程显式加载本地插件，避免重复加载已安装副本
+step --no-extensions -e ./index.ts
 ```
 
-脚本检查 Node 和已安装依赖，然后启动带插件的 Step Code；进入后仍通过 `/voice` 使用语音。Finder 双击启动不会继承另一个终端刚设置的 `export`，环境变量接入建议使用上面的同终端启动方式。
+进入终端后运行 `/voice setup` 配置接入，再用 `/voice panel` 打开面板。输入框为空时按 Enter 才开始语音；也可运行 `/voice start`。不要在命令消息中传入 Key。
+
+需要让正式桌面版加载这个源码目录时，先确认没有重复安装，再执行 `step install /absolute/path/to/StepFun-Voice`，随后重启桌面应用。
+
+仓库内的 `启动 Step Voice.command` 也是终端启动辅助入口，不是桌面面板安装器。
 
 ### 项目级安装
 
-插件已在 `package.json` 的 `pi.extensions` 中声明入口。也可通过 Step package 机制安装到当前项目：
+在目标项目中执行：
 
 ```bash
-# 在仓库根目录使用源码 CLI 安装。
-pnpm step install -l ./plugins/step-voice
-pnpm step
+step install -l /absolute/path/to/StepFun-Voice
 ```
 
-使用已安装的 `step` 命令时，可在目标项目中执行 `step install -l /path/to/StepFun-Voice`，将示例路径替换为实际插件目录。`-l` 将 package 引用写入目标项目的 `.stepcode/config.toml`；重新启动 Step Code 后即可运行 `/voice`。
+`-l` 将插件限定在当前项目。插件通过 `package.json` 中 `pi.extensions` 的 `./index.ts` 加载；`step.plugin.json` 记录插件身份，不会自动修改宿主程序。
 
-首次体验和开发可继续使用 `-e ./index.ts`，无需保存 package 设置。`step.plugin.json` 提供插件身份信息；启用入口使用上述 extension / Step package 加载方式。
+### 本地运行包
+
+```bash
+npm ci --ignore-scripts
+node scripts/package-plugin.mjs
+```
+
+脚本在 `.cache/releases/` 生成 `step-voice-<版本>-macos.zip`，只打包运行代码、文档和锁定版本的 `ws`；不包含测试数据、账号、录音和凭证。它是本地构建产物，不代表 GitHub 已创建 Release 或上传附件。
+
+`scripts/install-local-plugin.mjs` 仅用于备份并替换**已经存在且已注册**的 `~/.stepcode/local-packages/step-voice` 本地安装。它不修改加载配置、凭证或 `StepCode.app`；普通 GitHub 安装用户不需要运行这个维护脚本。
+
+## macOS 桌面端
+
+桌面端（StepCode.app）以 `rpc` 模式加载同一套扩展。当前宿主没有自定义侧栏/面板接口，本插件使用宿主原生的**选择弹窗**实现壳内语音控制：全程留在 StepCode 窗口，不打开浏览器，不另起 Agent，任务与权限仍归当前会话。
+
+### 使用
+
+正式版兼容包 `0.1.5` 使用现有扩展 API，不修改 StepCode.app，也不提供测试副本的常驻面板。安装、更新及验证范围见 [正式桌面版使用说明](FORMAL_DESKTOP.md)。
+
+1. 在桌面聊天输入框发送 `/voice panel` 打开语音控制弹窗，**不会开始录音**。该明确参数入口避免裸 `/voice` 被同名技能补全；`/voice` 仍然可用。
+2. 弹窗选项：
+   - **开始语音**：启动本机麦克风（首次按 macOS 提示授权）；停顿后最终转写直接提交当前任务，忙时排队。
+   - **静音/恢复麦克风**、**打断朗读/语音回复**、**结束通话**、**刷新状态**、**接入设置**、**关闭（结束通话）**。
+3. 弹窗内显示语音状态、接入通道、Key 状态、当前任务状态与最近字幕/输出摘要；选择“刷新状态”更新。
+4. `/voice start|mute|interrupt|end|stop|status|config` 仍可直接执行，适合通话中宿主正在运行时快速控制。
+5. 宿主开始任务或出现权限/交互提示时，语音弹窗自动让出焦点；通话保持进行，重新发送 `/voice` 可回到控制。工具权限确认始终在 StepCode 处理，插件不代为批准。
+
+### 接入设置（无浏览器页面）
+
+`/voice setup` 在壳内弹窗中完成：选择通道（开放平台 API / Step Plan）→ 选择 Key 来源（粘贴输入 / 环境变量 / 保留 / 清除）→ 实时验证后保存。桌面宿主没有密码输入框，“粘贴输入”调用 macOS 系统隐藏输入框（osascript hidden answer），Key 不进入聊天内容、模型上下文或命令日志。保存位置与终端一致：`~/.stepcode/step-voice/credentials.json`（仅当前用户可读）。
+
+### 边界
+
+- 这是弹窗控制，不是持续常驻侧栏；查看字幕/电平用“刷新状态”。宿主后续版本提供面板 API 后可升级。
+- 弹窗空闲约 2 分钟自动关闭，未开始的采集不会残留；明确“关闭（结束通话）”会结束当前通话。
+- 同机 macOS 方案；Windows 分支未同步。真实录音与在线转写需授权后验收。
 
 ## 终端操作
 
 | 命令 | 用途 |
 | --- | --- |
-| `/voice` | 打开语音面板；后台 Agent 工作时显示终端语音状态控件 |
+| `/voice` / `/voice panel` | 打开语音面板；后台 Agent 工作时显示终端语音状态控件 |
 | `/voice start` | 开始语音，申请本机麦克风访问 |
 | `/voice mute` | 切换麦克风静音 |
 | `/voice interrupt` | 清空本地播放队列（含打断朗读）；不取消上游转写，也不停止编码任务 |
@@ -203,7 +270,7 @@ Key 有两个来源：
 | `STEP_API_KEY` / `STEPFUN_API_KEY` | 无 | StepFun API Key（面板里保存的 Key 优先） |
 | `STEP_VOICE_CHANNEL` | `api` | 未在面板选择时的通道：`api` 或 `step_plan` |
 | `STEP_VOICE_BASE_URL` | 随通道 | 官方 API 地址：`/v1`（开放平台）或 `/step_plan/v1`（Step Plan），域名可为 `api.stepfun.com` / `api.stepfun.ai` |
-| `STEP_VOICE_REALTIME_MODEL` | `stepaudio-3-realtime-preview` | Realtime 转写与原生语音回复 |
+| `STEP_VOICE_REALTIME_MODEL` | `stepaudio-3-realtime-preview` | Realtime 输入转写（回复事件默认丢弃） |
 | `STEP_VOICE_TTS_MODEL` | `stepaudio-3-tts` | 任务结果朗读的 TTS 模型 |
 | `STEP_VOICE_SUMMARY_MODEL` | `step-3.7-flash` | 结果总结用的文本模型，需为账号可用模型；调用失败自动回退为截断 |
 | `STEP_VOICE_VOICE` | `linjiajiejie` | 语音音色 |
@@ -225,7 +292,7 @@ Key 有两个来源：
 - 每段说话最长等待 120 秒；结束/提交后转写等待 15 秒。失败、空文本、缺失索引或超长文本明确显示“未提交”，并释放后续输入。缺失输入项 ID、超过 32 段积压或 2048 个会话输入项时停止语音，不通过淘汰去重记录允许重放。
 - 忙时语音始终 followUp，不自动调整当前任务。文字可以 Tab 选 steer。说“停止后台任务”也是普通后续文字；需要立即停止请按 Ctrl+G 或使用宿主取消操作。
 - 结束通话或重连不会重放录音，未完成的转写被丢弃；已经提交的任务继续由宿主管理。麦克风打开后，环境里其他人的话也可能被识别成输入，请在安静且可控的环境使用。
-- 需要权限确认时，面板先让出焦点，请在主终端处理；插件不会自动批准工具或绕过项目可信检查。
+- 需要权限确认时，插件界面先让出焦点，请在 StepCode 主界面处理；插件不会自动批准工具或绕过项目可信检查。
 
 ### 任务结果朗读
 
@@ -233,15 +300,15 @@ Key 有两个来源：
 
 1. 取宿主真实输出的结尾（脱敏后最多 100 字）；
 2. 调用总结模型压缩为口语化摘要（模型不可用时自动回退为该截断文本，并在面板提示一次原因）；
-3. 面板随即显示将朗读的全文字幕，已读部分随播放进度高亮：高亮按合成音频的字节时钟推进（PCM16 24 kHz 单声道 = 48 字节/毫秒），语速取本次朗读的自适应倍速；
+3. 面板显示将朗读的全文字幕；高亮按收到的音频字节数估算（PCM16 24 kHz 单声道 = 48 字节/毫秒），不是播放器已播放帧数；
 4. 调用 TTS 合成，语速按摘要长度自适应：80 字内原速，超长按比例提速（上限 2 倍），整段控制在播放队列 30 秒上限内；
 5. 播放期间麦克风自动静音（防外放回声循环），播完恢复；`STEP_VOICE_ECHO_CANCEL=1` 时不静音，支持语音打断。
 
-字幕在朗读开始时就完整可见，高亮位置是字级估算（起止点精确，标点停顿处可能有轻微漂移）；合成完成不等于播放完成，字幕会等音频播完才真正收尾。`voice.interrupt` / Ctrl+X 会同时终止合成、播放与字幕。
+字幕在合成开始时就完整可见，高亮可能领先实际播放；尚未接入播放器进度来实现准确逐字对齐。收尾使用播放结束通知和超时兜底，不应作为精确同步的证明。`voice.interrupt` / Ctrl+X 会同时终止合成、播放与字幕。
 
 `voice.interrupt` / Ctrl+X 会同时终止合成与播放。总结失败与播放队列溢出都只产生面板提示，不影响语音会话。
 
-**真实输出以 Step Code 主终端为准。** 面板只展示当前宿主公开文本的有限预览（最多 4 行，底层最多保留 24000 字符），同步工具状态、完成和错误，不包含内部思考或完整工具参数。任务开始时清除旧预览；面板收起后控件仍显示状态与错误。宿主结果不会被重新发送给 Realtime；Realtime 模型的语音回复与 TTS 朗读只是对话反馈，不改变 Step Code 的输出权威。
+**真实输出以 StepCode 主界面为准。** 插件只展示当前宿主公开文本的有限预览，同步任务状态、完成和错误，不包含内部思考或完整工具参数。终端面板使用有限行数预览，桌面弹窗展示最近字幕/输出摘要。宿主结果不会被重新发送给 Realtime；直送模式丢弃 Realtime 模型自发的回复，结果朗读来自宿主实际输出。
 
 ## 排障指南
 
@@ -271,21 +338,56 @@ Key 有两个来源：
 
 宿主的 `sendUserMessage` 返回 `void`，因此“已提交 / 已排队”只表示已尝试交给宿主，不是执行成功确认。插件在 45 秒未观察到开始、且宿主没有运行任务或等待交互时，显示无启动错误；排队时继续等待当前工作/权限结束。同步提交异常会清除本次关联，**接受结果不确定时不补发、不自动重试**。请先核对主终端的用户消息、队列、模型/登录错误，再决定是否重新输入。
 
-## 测试
+## 测试与验证范围
+
+`npm test` 默认禁止外部 HTTP/TCP，只允许 loopback；遗漏 mock 会直接失败，不会请求真实语音服务。**独立运行仍需要宿主的 TUI 模块**，裸 `npm test` 在没有该依赖时会报错，不会静默跳过 UI 测试。
+
+### 正式桌面宿主回归
 
 ```bash
-STEP_CODE_SOURCE=/path/to/Step-Code node --test \
-  test/bridge.test.mjs test/server.test.mjs test/stepfun.test.mjs \
-  test/terminal-controller.test.mjs test/terminal-ui.test.mjs
+# 基础回归 + 已安装正式宿主的命令分发、SelectionBroker、补全行为
+STEP_CODE_TUI=/Applications/StepCode.app/Contents/Resources/server/node_modules/@step-harness/pi-tui/dist/index.js \
+STEP_CODE_HOST=/Applications/StepCode.app/Contents/Resources/server/node_modules/@step-harness \
+npm test
+
+# 单独验证弹窗逻辑，不依赖 TUI 模块
+node --import ./test/offline-network.mjs --test test/desktop-dialog.test.mjs
+
+# 真正打开未修改的正式程序，在独立测试配置中检查插件弹窗
+STEP_VOICE_PACKAGE="$PWD" node scripts/formal-desktop-smoke.mjs
 ```
 
-`STEP_CODE_SOURCE` 仅提供已安装依赖的宿主真实 TUI 模块，正常运行由宿主 loader 提供。测试使用模拟宿主、WebSocket、API 响应和音频适配器；server 测试只建立 localhost 服务，凭证测试使用临时目录，不读取真实凭证、不录音、不请求真实 API。覆盖最终转写直送、重放、乱序、失败与超时、旧会话隔离、宿主错误、无启动超时、文字队列、真实文本预览、模型语音回复播放与回退、TTS 朗读与总结回退、回声 duck。
+桌面 UI 检查需要本机安装 StepCode 0.2.0 和 CLI，使用临时 HOME、占位模型声明和网络保护，不使用真实账号，也不申请麦克风权限。默认程序位置是 `/Applications/StepCode.app`，可用 `STEP_CODE_APP`、`STEP_CODE_CLI` 指定其他位置。它会打开并关闭一个独立测试窗口，不重启你的工作窗口。
 
-mock 测试不能替代真机验收：请在授权麦克风后说一句无副作用请求（例如“请原样回复：直送测试成功”），核对一条原生转写、一次宿主提交、对应真实输出与朗读。
+### 可选 Voice v1 开发宿主验证
+
+```bash
+# 需要已经打过 Voice v1 补丁、安装依赖并构建的独立宿主源码
+STEP_CODE_SOURCE=/path/to/patched-Step-Code \
+STEP_CODE_VOICE_SOURCE=/path/to/patched-Step-Code npm test
+
+STEP_CODE_VOICE_SOURCE=/path/to/patched-Step-Code npm run check:types
+```
+
+未设置 `STEP_CODE_VOICE_SOURCE` 时，3 项新宿主构建产物测试明确跳过；未设置 `STEP_CODE_HOST` 时，2 项正式桌面宿主测试明确跳过。这些条件不能与“全部通过”混为一谈。Voice v1 补丁不包含在普通插件安装中，详见 [Harness 接入说明](HARNESS_INTEGRATION.md)。
+
+### 0.1.5 验证记录（2026-11-01）
+
+| 检查 | 结果与前提 |
+| --- | --- |
+| 完整自动化套件 | **174 通过、0 失败、0 跳过**；同时提供正式桌面模块与配套 Voice v1 源码 |
+| 最终安装目录的正式宿主检查 | **2 项通过**；真实发现/加载、命令分发、选择 broker 与前端补全 |
+| 未修改的正式桌面程序 UI 检查 | **5 项通过**；独立测试配置中实际输入 `/voice panel`，查看弹窗并截图 |
+| TypeScript | 配套宿主公开类型下通过 |
+| Swift `--self-test` | 离线 PCM 转换通过，`permissionRequested: false`；不测试真实录音 |
+
+核心覆盖包括转写直送、去重和乱序、超时、旧会话隔离、任务状态、文字队列、摘要/TTS 回退、播放中静音、启动取消和资源清理。截图、测试日志、运行 ZIP 和安装回执写入本地 `.cache/` 或临时目录，不随源码上传。
+
+**真人语音尚需单独验收。** 由你主动配置 Key 并授权麦克风后，说一句无副作用请求，核对一次转写、一次宿主提交、真实输出与朗读。不要把模拟模型或隔离常驻面板的测试结果当作正式版真人语音已验收。
 
 ## 边界与限制
 
-- Windows / Linux 的原生音频适配尚未实现；语音功能仅限 macOS。
+- 本 `main` 分支只提供 macOS 原生音频；Windows 版本位于独立 `windows` 分支，本次 0.1.5 桌面兼容改动未同步到该分支。Linux 不在本次支持范围。
 - 实际延迟、中文识别、音色效果、扬声器回声表现，需要在配置 Key 的 macOS 设备上验证。VAD 由 StepFun 服务端判定，网络延迟与录音环境会影响打断速度。
 - 总结模型 `step-3.7-flash` 为思考型模型，朗读前有几秒总结延迟；若账号无此模型，朗读自动回退为结尾截断并在面板提示。
 - 国内和海外 API 的账号、Key、模型可用性需要分别核实，插件不会自动跨地区发送 Key。服务与型号变化时，以 StepFun 当前文档为准。

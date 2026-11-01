@@ -1,103 +1,70 @@
-# Step Voice GitHub 分发与安装
+# GitHub 分发与安装
 
-GitHub 可以直接托管这个终端语音插件。Step Code 支持从 Git 仓库 clone、安装运行依赖并注册 extension，因此不需要 npm 账号或 npm 包发布。本插件没有 npx 安装器和 npm 发布脚本，`package.json` 的 `private: true` 阻止意外 npm 发布。
+插件源码仓库：[Zgh332358/StepFun-Voice](https://github.com/Zgh332358/StepFun-Voice)。`main` 是 macOS 分支；普通插件不修改正式 `StepCode.app`，桌面入口为 `/voice panel`，不是常驻侧栏。
 
-插件使用独立的 [Zgh332358/StepFun-Voice 仓库](https://github.com/Zgh332358/StepFun-Voice)。以下安装与版本命令均指向这个仓库。
+## 从 GitHub 安装
 
-## 仓库结构
+需要 Node.js ≥ 22.19、Git、StepCode，以及用于编译原生音频助手的 Xcode Command Line Tools。
 
-把当前插件目录中的内容放到 GitHub 仓库根目录：
+```bash
+# 用户范围：适合正式桌面应用和多个项目
+step install git:github.com/Zgh332358/StepFun-Voice
 
-```text
-StepFun-Voice/
-  package.json
-  package-lock.json
-  index.ts
-  step.plugin.json
-  src/
-  native/
-  test/
-  README.md
-  GITHUB.md
-  LICENSE
-  .gitignore
+# 或：只在当前项目启用
+step install -l git:github.com/Zgh332358/StepFun-Voice
 ```
 
-可将交付的 `Step-Voice-plugin.zip` 解压后，使用内部 `step-voice` 目录作为仓库根目录。不要将它再次套在远端仓库的 `plugins/step-voice` 下：当前 Step Code Git package 从仓库根目录读取 manifest，没有独立的 Git 子目录安装参数。
+二选一即可。安装后保存工作并重启 StepCode，然后发送 `/voice panel`。需要接入设置时用 `/voice setup`，不要把 Key 发到聊天里。打开弹窗不会录音；开始通话和在线验证均由你主动触发。
 
-`pi.extensions` 中的 `./index.ts` 是宿主实际使用的入口。Swift 音频助手使用相对模块路径定位 `native/VoiceAudio.swift` 和 `Info.plist`，因此 clone 位置变化不影响定位。
+宿主负责下载仓库、安装 `ws` 运行依赖和保存扩展引用。`pi.extensions` 中的 `./index.ts` 是真实加载入口。无需 npm 账号；仓库的 `private: true` 防止误发 npm。
 
-## 开发与发布
+## 更新与卸载
 
-开发时 clone 源码仓库，在自己的 checkout 中修改和测试：
+```bash
+step list
+step update git:github.com/Zgh332358/StepFun-Voice
+step remove git:github.com/Zgh332358/StepFun-Voice
+```
+
+如果原来使用 `-l` 安装，卸载时也添加 `-l`。更新前结束通话，更新后重启应用。
+
+**本地目录与 GitHub 地址是不同来源。** 如果 `step list` 显示本地安装，先备份并移除该来源，再决定是否改为 GitHub 安装；不要把两份同 ID 插件叠加加载。不要直接修改宿主管理的 Git clone 缓存，后续更新可能覆盖它。
+
+要固定版本，可在 Git 来源后添加 `@<tag-or-commit>`，但必须先确认远端 ref 存在。修改 `package.json` 的版本、推送 `main`、创建 tag、创建 GitHub Release 和上传 ZIP 是不同操作，不能相互替代。
+
+## 本地开发
 
 ```bash
 git clone https://github.com/Zgh332358/StepFun-Voice.git
 cd StepFun-Voice
 npm ci --ignore-scripts
-# TUI 测试使用已安装依赖的 Step Code 源码 checkout。
-STEP_CODE_SOURCE=/path/to/Step-Code npm test
+step --no-extensions -e ./index.ts
 ```
 
-提交前确认 Git 作者信息是你的身份；向这个仓库推送需要已有写入权限。不要上传 `node_modules`、本机音频编译产物或凭证文件，`.gitignore` 已忽略相关文件。插件仅读取进程环境变量。
+本仓库是独立插件，不包含宿主的 `plugins/step-voice` 子目录或 pnpm workspace。`--no-extensions` 只关闭该开发进程的自动发现，仍加载显式 `-e` 参数，避免与已安装副本重复注册。
 
-## 一条命令安装
-
-用户需要先安装 Step Code、Node.js 22.19 或更高版本、Git，以及 macOS Xcode Command Line Tools。在目标项目中执行：
+## 构建运行 ZIP
 
 ```bash
-step install -l git:github.com/Zgh332358/StepFun-Voice
+node scripts/package-plugin.mjs
 ```
 
-Step Code 会 clone 到当前项目 `.stepcode/git/` 中，自动处理 `ws` 运行依赖，并把插件来源注册到项目 `.stepcode/config.toml`。不带 `-l` 时使用用户范围，clone 放到 `~/.stepcode/agent/git/`，来源保存在 `~/.stepcode/config.toml`。
-
-安装后重新启动 Step Code，或在现有会话运行 `/reload`。开始语音前，在启动 Step Code 的同一个终端设置 StepFun 开放平台 Key：
+产物位于 `.cache/releases/step-voice-<版本>-macos.zip`，解压后得到 `step-voice/`。包内含锁定的 `ws` 运行依赖，安装方式为：
 
 ```bash
-export STEP_API_KEY='你的 StepFun API Key'
-step
+step install /absolute/path/to/step-voice
 ```
 
-进入后输入 `/voice`，在输入框为空时按 Enter 开始语音。打开插件面板不自动开启麦克风。Step Plan / OAuth 登录不能替代语音模型需要的开放平台 Key。
+运行 ZIP 不是源码仓库的完整替代：测试和开发脚本留在 GitHub 源码中。构建脚本拒绝覆盖已有同名 ZIP，应先核对并保留旧产物，再重新构建。
 
-从已安装依赖的 Step Code 源码仓库启动时，可把安装命令中的 `step` 换成 `pnpm step`，然后运行 `pnpm step`。
+## 验证与提交
 
-## 更新、固定版本和卸载
+正式桌面与可选开发宿主的检查命令、前置条件和已验证范围见 [README](README.md#测试与验证范围)；桌面日常操作见 [FORMAL_DESKTOP.md](FORMAL_DESKTOP.md)。
 
-```bash
-step list
-step update --extension git:github.com/Zgh332358/StepFun-Voice
-step remove -l git:github.com/Zgh332358/StepFun-Voice
-```
+提交前确认 Git 作者身份及 diff，只上传代码、测试和公开文档。不要上传 `node_modules/`、`.cache/`、原生编译缓存、录音、会话记录、安装备份或任何凭证。语音 Key 在运行时由环境变量或独立凭证文件提供，不属于插件包。
 
-更新命令不带 `-l`，按仓库身份匹配用户与当前项目已配置的来源。不固定 ref 时更新当前跟踪分支。用户范围卸载使用不带 `-l` 的 remove。
+## 参考
 
-要发布明确版本，先在插件仓库创建并推送对应 tag，例如 `v0.1.0`；随后可在 GitHub 创建 Release。GitHub Release 会提供该 tag 的源码 ZIP / tarball，也可以附加手动制作的 ZIP。
-
-```bash
-# 在仓库确实存在 v0.1.0 tag 后使用。
-step install -l git:github.com/Zgh332358/StepFun-Voice@v0.1.0
-```
-
-固定 tag / commit 的配置不会随普通更新切换到新版本；升级时用新 ref 重新执行 install。Step Code 管理的 clone 是安装缓存，更新会重置并清理其中的改动，开发修改应在自己的源码目录中进行。
-
-## 本地使用和验证
-
-也可以从本地目录加载。将路径替换成解压后的插件目录：
-
-```bash
-step install -l /path/to/step-voice
-step
-```
-
-本地目录需要已有运行依赖；在插件目录执行 `npm ci --ignore-scripts`，再加载即可。这里的 npm 仅安装 Node 运行依赖，不注册账号、不发布插件。GitHub 安装路径由宿主自动完成依赖安装。
-
-从插件源码目录运行 `STEP_CODE_SOURCE=/path/to/Step-Code npm test` 做完整离线验证，替换为已安装依赖的 Step Code 源码 checkout。该变量仅用于测试，从 GitHub 安装插件时不需要；正常运行的宿主 loader 提供 TUI 模块。默认 Realtime 和 TTS 已通过真实请求，macOS 实际采集、播放与回声消除，以及 Step Code 0.1.3 的连续启停已做短测试。长时间真人交流、多设备和噪声环境的体验仍需验证，具体范围见 [README](README.md#验证与当前边界)。
-
-## 官方参考
-
-- [Step Code 官方仓库](https://github.com/stepfun-ai/Step-Code)
-- [Step Code package 文档](https://github.com/stepfun-ai/Step-Code/blob/main/packages/coding-agent/docs/packages.md)
-- [GitHub Release 说明](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)
-
-安装语法、实际配置路径和入口声明已按交付时的本地 Step Code 源码核对；旧文档中 `settings.json` 的配置路径文字不适用于当前原生 Step 实现。
+- [StepCode 官方仓库](https://github.com/stepfun-ai/Step-Code)
+- [StepCode package 文档](https://github.com/stepfun-ai/Step-Code/blob/main/packages/coding-agent/docs/packages.md)
+- [GitHub Release 文档](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)

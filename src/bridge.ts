@@ -227,18 +227,18 @@ export function createVoiceAgentBridge(pi: ExtensionAPI, { taskStartTimeoutMs = 
 
 	pi.on("ui_prompt_start", (event, ctx) => {
 		setContext(ctx);
-		if (event.kind === "custom" && voicePanelOpen) {
+		if ((event.kind === "custom" || event.kind === "select") && voicePanelOpen) {
 			ignoredVoicePrompts += 1;
 			return;
 		}
 		waitingPrompts += 1;
-		status = `请在 Step Code 终端处理${event.kind === "confirm" ? "权限确认" : "交互问题"}`;
+		status = `请在 StepCode ${ctx.mode === "rpc" ? "桌面端" : "终端"}处理${event.kind === "confirm" ? "权限确认" : "交互问题"}`;
 		emit({ type: "agent.status" });
 	});
 
 	pi.on("ui_prompt_end", (event, ctx) => {
 		setContext(ctx);
-		if (event.kind === "custom" && ignoredVoicePrompts > 0) {
+		if ((event.kind === "custom" || event.kind === "select") && ignoredVoicePrompts > 0) {
 			ignoredVoicePrompts -= 1;
 			return;
 		}

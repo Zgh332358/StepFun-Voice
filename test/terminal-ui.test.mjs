@@ -15,9 +15,12 @@ const workspaceTui = process.env.STEP_CODE_SOURCE
 if (process.env.STEP_CODE_SOURCE && !existsSync(workspaceTui)) {
 	throw new Error("STEP_CODE_SOURCE must point to a Step Code source checkout with packages/tui/src/index.ts and installed dependencies.");
 }
-if (existsSync(workspaceTui)) registerHooks({
+const installedTui = process.env.STEP_CODE_TUI ? pathToFileURL(resolve(process.env.STEP_CODE_TUI)) : undefined;
+if (installedTui && !existsSync(installedTui)) throw new Error("STEP_CODE_TUI must point to the installed host's pi-tui/dist/index.js.");
+const tuiModule = installedTui ?? (existsSync(workspaceTui) ? workspaceTui : undefined);
+if (tuiModule) registerHooks({
 	resolve(specifier, context, nextResolve) {
-		if (specifier === "@step-harness/pi-tui") return { url: workspaceTui.href, shortCircuit: true };
+		if (specifier === "@step-harness/pi-tui") return { url: tuiModule.href, shortCircuit: true };
 		return nextResolve(specifier, context);
 	},
 });
@@ -26,7 +29,7 @@ try {
 	({ TerminalVoicePanel, voiceWidgetLines } = await import("../src/terminal-ui.ts"));
 } catch (error) {
 	if (error.code === "ERR_MODULE_NOT_FOUND" && String(error.message).includes("@step-harness/pi-tui")) {
-		throw new Error("Terminal UI tests need the host TUI module. Run STEP_CODE_SOURCE=/path/to/Step-Code npm test with an installed Step Code source checkout.", { cause: error });
+		throw new Error("Terminal UI tests need the host TUI module. Set STEP_CODE_SOURCE to a source checkout or STEP_CODE_TUI to the installed host's pi-tui/dist/index.js.", { cause: error });
 	}
 	throw error;
 }

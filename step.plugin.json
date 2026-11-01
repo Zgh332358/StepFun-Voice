@@ -1,7 +1,7 @@
 {
 	"id": "step-voice",
 	"name": "Step Voice",
-	"description": "Native terminal voice with StepFun models, connected to the current Step Code agent via /voice.",
-	"version": "0.1.1",
+	"description": "StepFun voice for the current StepCode session: terminal panel or macOS desktop dialogs via /voice panel, without modifying the host.",
+	"version": "0.1.5",
 	"entry": "index.ts"
 }

@@ -144,24 +144,32 @@ export function handshakeHint(status) {
  * Live check used by the first-run setup: the Key must be accepted by the
  * channel and the channel's realtime model must open a session.
  */
-export async function verifyChannelAccess(config, { WebSocketImpl, fetchImpl = globalThis.fetch, timeoutMs = 15_000 } = {}) {
+export async function verifyChannelAccess(config, { WebSocketImpl, fetchImpl = globalThis.fetch, timeoutMs = 15_000, signal } = {}) {
 	const channel = CHANNELS[config.channel] || CHANNELS.api;
 	const planHint = config.channel === "step_plan" ? `请确认账号已订阅 Step Plan（${CHANNELS.step_plan.subscribeUrl}）。` : "请确认该 Key 有实时语音模型权限且账户余额充足。";
 	let response;
 	try {
-		response = await fetchImpl(`${config.baseUrl}/models`, { headers: { Authorization: `Bearer ${config.apiKey}` }, signal: AbortSignal.timeout(timeoutMs) });
+		signal?.throwIfAborted();
+		const timeout = AbortSignal.timeout(timeoutMs);
+		response = await fetchImpl(`${config.baseUrl}/models`, { headers: { Authorization: `Bearer ${config.apiKey}` }, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+		signal?.throwIfAborted();
 	} catch (error) {
 		return { ok: false, reason: "network", message: `无法连接 StepFun（${sanitizeProviderError(error, config.apiKey)}）。请检查网络或代理。` };
 	}
 	if (response.status === 401) return { ok: false, reason: "key", message: `${channel.label} 不认这个 Key（401）。请到 ${channel.keyUrl} 复制完整的 API Key 后重试。` };
 	if (!response.ok) return { ok: false, reason: "http", message: `${channel.label} 返回 HTTP ${response.status}。${planHint}` };
 	const client = new StepFunRealtimeClient({ ...config, turnDetection: null }, { WebSocketImpl, delegate: false });
+	const onAbort = () => client.close();
+	signal?.addEventListener("abort", onAbort, { once: true });
 	try {
+		signal?.throwIfAborted();
 		await client.connect({ timeoutMs });
+		signal?.throwIfAborted();
 		return { ok: true };
 	} catch (error) {
 		return { ok: false, reason: "realtime", message: `Key 有效，但 ${channel.label} 上无法使用实时模型 ${config.realtimeModel}：${sanitizeProviderError(error, config.apiKey)} ${planHint}` };
 	} finally {
+		signal?.removeEventListener("abort", onAbort);
 		client.close();
 	}
 }

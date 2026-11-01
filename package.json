@@ -1,6 +1,6 @@
 {
 	"name": "step-voice",
-	"version": "0.1.1",
+	"version": "0.1.5",
 	"description": "StepFun voice chat plugin connected to the current Step Code agent",
 	"type": "module",
 	"license": "MIT",
@@ -15,7 +15,8 @@
 		]
 	},
 	"scripts": {
-		"test": "node --test test/*.test.mjs"
+		"test": "node --import ./test/offline-network.mjs --test test/*.test.mjs",
+		"check:types": "node test/typecheck.mjs"
 	},
 	"engines": {
 		"node": ">=22.19.0"
