@@ -22,11 +22,14 @@ step install -l git:github.com/Zgh332358/StepFun-Voice
 
 ```bash
 step list
-step update git:github.com/Zgh332358/StepFun-Voice
+# 更新：再次安装同一来源，宿主会 fetch 并快进该 Git clone
+step install git:github.com/Zgh332358/StepFun-Voice
 step remove git:github.com/Zgh332358/StepFun-Voice
 ```
 
-如果原来使用 `-l` 安装，卸载时也添加 `-l`。更新前结束通话，更新后重启应用。
+如果原来使用 `-l` 安装，卸载时也添加 `-l`。更新前结束通话，更新后**退出并重新启动 StepCode**。
+
+`step update <扩展来源>` 在 StepCode 0.2.1 中是 Step 自身更新（`step update [version]`），不会更新插件；请使用重复安装，或该版本确实支持的 `step update --extensions`。
 
 **本地目录与 GitHub 地址是不同来源。** 如果 `step list` 显示本地安装，先备份并移除该来源，再决定是否改为 GitHub 安装；不要把两份同 ID 插件叠加加载。不要直接修改宿主管理的 Git clone 缓存，后续更新可能覆盖它。
 

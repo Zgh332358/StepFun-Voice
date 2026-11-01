@@ -144,16 +144,19 @@ step
 
 ### 管理安装
 
-不带 `-l` 时安装到用户范围，可用于其他项目。当前项目引用保存在 `.stepcode/config.toml`；用户引用保存在 `~/.stepcode/config.toml`，由 Step Code 管理。安装后重新启动 Step Code，或通过 `/reload` 重载。查看、更新和卸载：
+不带 `-l` 时安装到用户范围，可用于其他项目。当前项目引用保存在 `.stepcode/config.toml`；用户引用保存在 `~/.stepcode/config.toml`，由 Step Code 管理。安装后需要**退出并重新启动 StepCode**；已打开的会话不会热更新扩展代码。查看、更新和卸载：
 
 ```bash
 step list
-step update git:github.com/Zgh332358/StepFun-Voice
+# 更新已安装的 Git 扩展：再次安装同一来源，宿主会 fetch 并快进该 clone
+step install git:github.com/Zgh332358/StepFun-Voice
 step remove git:github.com/Zgh332358/StepFun-Voice
 # 若原来使用 -l 安装，卸载也添加 -l
 ```
 
-`update` 按已配置的仓库来源更新；不固定 ref 时跟随该来源的分支。需要固定版本时，先确认目标 tag 或提交确实存在，再在 Git 来源后添加 `@<ref>`。`package.json` 中的版本号不等于已经创建了同名 Git tag。
+**不要用 `step update <扩展来源>` 更新扩展。** 在 StepCode 0.2.1 中，`step update` 只处理 Step 自身版本，形如 `step update [version]`；传入仓库地址会得到用法错误，而不会更新插件。若该版本的 `step update --extensions` 可用，也可以使用它；否则以上面的重复安装方式为准。
+
+需要固定版本时，先确认目标 tag 或提交确实存在，再在 Git 来源后添加 `@<ref>`。`package.json` 中的版本号不等于已经创建了同名 Git tag。
 
 **本地安装与 GitHub 安装不是同一个来源。** 如果 `step list` 显示本地目录，请保留旧目录备份后再决定是更新本地文件，还是移除该本地来源并安装 GitHub 来源；不要直接叠加两份 Step Voice。更新前先结束通话，更新后重启正式桌面应用。
 
@@ -313,6 +316,13 @@ Key 有两个来源：
 **真实输出以 StepCode 主界面为准。** 插件只展示当前宿主公开文本的有限预览，同步任务状态、完成和错误，不包含内部思考或完整工具参数。终端面板使用有限行数预览，桌面弹窗展示最近字幕/输出摘要。宿主结果不会被重新发送给 Realtime；直送模式丢弃 Realtime 模型自发的回复，结果朗读来自宿主实际输出。
 
 ## 排障指南
+
+### `/stepvoice` 没有反应，或首次只有技能候选
+
+1. 升级后必须**退出并重新启动 StepCode**；扩展代码不会在已打开的会话中热更新。
+2. 运行 `step list`，确认已安装来源只有一份，并检查该目录 `package.json` 的 `version` 为 `0.1.6`，`index.ts` 中注册的是 `stepvoice`。仍显示 `0.1.5` 说明更新没有生效。
+3. 若同时存在本地目录来源和 Git 来源，只保留一份，否则会加载两个版本的插件。
+4. 桌面输入框在输入 `/step` 时仍可能显示技能列表，这只是候选区；要继续输入完整 `/stepvoice` 并按 Enter，插件命令才会被宿主分发。
 
 ### 麦克风电平表恒为 0%
 
