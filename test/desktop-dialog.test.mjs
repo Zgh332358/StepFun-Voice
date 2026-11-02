@@ -1,151 +1,103 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { Server } from 'node:net';
 import stepVoice from '../index.ts';
-const tick = () => new Promise(r => setImmediate(r));
-async function waitDialog(r, ms = 4000) {
-  const end = Date.now() + ms;
-  while (!r.hasPendingDialog() && Date.now() < end) await new Promise(res => setTimeout(res, 5));
-  assert.ok(r.hasPendingDialog(), 'dialog did not appear');
-}
+import { getComposerVoiceHost, COMPOSER_PROTOCOL } from '../src/composer-contract.ts';
+import { NativeAudioEngine } from '../src/native-audio.mjs';
+import { NativeVoiceHUD } from '../src/native-hud.mjs';
 
-/** Mock RPC host: voice relay is faked by pre-configured env; native audio start is never exercised in menu navigation. */
-function rpcHost(t, { keyConfigured = true } = {}) {
-  const home = mkdtempSync(join(tmpdir(), 'step-voice-dialog-'));
-  const old = { home: process.env.STEP_VOICE_HOME, key: process.env.STEP_API_KEY };
-  process.env.STEP_VOICE_HOME = home;
-  if (keyConfigured) process.env.STEP_API_KEY = 'sk-fake-dialog-test-no-provider'; else delete process.env.STEP_API_KEY;
-  t.after(() => {
-    for (const [k, v] of [['STEP_VOICE_HOME', old.home], ['STEP_API_KEY', old.key]]) v === undefined ? delete process.env[k] : process.env[k] = v;
-    rmSync(home, { recursive: true, force: true });
-  });
-  const dialogs = [], commands = new Map(), execs = [];
-  let answer;
-  const pi = new EventEmitter();
-  pi.registerCommand = (name, spec) => commands.set(name, spec);
-  pi.exec = async (command, args) => { execs.push({ command, args }); return { code: 1, stdout: '' }; };
-  pi.sendUserMessage = () => {};
-  const ctx = { mode: 'rpc', hasUI: true, cwd: '/test', model: { provider: 'step', id: 'm' },
-    sessionManager: { getSessionId: () => 'rpc-session', getSessionName: () => 'Dialog test' },
+function host(t, voiceComposer) {
+  t.mock.method(NativeAudioEngine.prototype, 'start', () => assert.fail('desktop must not use Swift audio'));
+  t.mock.method(NativeVoiceHUD.prototype, 'show', () => assert.fail('desktop must not fall back to HUD'));
+  t.mock.method(Server.prototype, 'listen', () => assert.fail('desktop must not start a local relay'));
+  const pi = new EventEmitter(), commands = new Map(), notices = [];
+  pi.registerCommand = (name, command) => commands.set(name, command);
+  pi.exec = () => assert.fail('desktop must not launch OS helpers');
+  pi.sendUserMessage = () => assert.fail('transcripts must not auto-submit through the legacy bridge');
+  const ctx = { mode: 'rpc', hasUI: true, cwd: '/test', voiceComposer,
+    sessionManager: { getSessionId: () => 'session-1', getSessionName: () => 'fixture' },
     isIdle: () => true, hasPendingMessages: () => false,
-    ui: { select(title, items, opts) { dialogs.push({ title, items });
-        return new Promise(resolve => { answer = resolve;
-          opts?.signal?.addEventListener('abort', () => resolve(undefined), { once: true }); }); },
-      notify() { assert.fail('desktop flow must use dialogs, not notify'); },
-      custom() { assert.fail('desktop must not use TUI custom'); } } };
+    ui: { select: () => assert.fail('no modal fallback'), custom: () => assert.fail('no TUI fallback'),
+      notify: (message, kind) => notices.push({ message, kind }) } };
   stepVoice(pi);
-  return { dialogs, execs, ctx, commands, command: commands.get('stepvoice'), events: pi,
-    resolveCurrent(value) { const a = answer; answer = undefined; a?.(value); },
-    hasPendingDialog: () => Boolean(answer),
-    async shutdown() { for (const fn of pi.listeners('session_shutdown')) await fn({}, ctx); } };
+  const emit = async name => { for (const handler of pi.listeners(name)) await handler({}, ctx); };
+  t.after(() => emit('session_shutdown'));
+  return { commands, ctx, notices, emit, run: action => commands.get('stepvoice').handler(action, ctx) };
+}
+function composer() {
+  const registrations = [], actions = []; let closes = 0;
+  const capability = { protocol: COMPOSER_PROTOCOL, surface: 'composer', registerProvider(provider, configuration) {
+    registrations.push({ provider, configuration });
+    return { async command(action) { actions.push(action); }, async dispose() { closes++; } };
+  } };
+  return { capability, registrations, actions, get closes() { return closes; } };
 }
 
-test('registers stepvoice as the only user command with the existing subcommands', t => {
-  const r = rpcHost(t, { keyConfigured: false }); t.after(() => r.shutdown());
-  assert.deepEqual([...r.commands.keys()], ['stepvoice']);
-  assert.deepEqual(r.commands.get('stepvoice').getArgumentCompletions('').map(item => item.value),
+test('released desktop without composer capability only explains the blocker for every voice action', async t => {
+  const h = host(t); await h.emit('session_start');
+  assert.equal(h.notices.length, 0);
+  for (const action of ['', 'panel', 'start', 'mute', 'interrupt', 'end', 'setup', 'status']) {
+    await h.run(action);
+    assert.match(h.notices.at(-1).message, /未提供输入栏语音插件接口/);
+  }
+  await h.run('stop');
+  assert.equal(h.notices.length, 8);
+});
+
+test('legacy Voice v1 is not mistaken for an implemented composer contract', async t => {
+  const h = host(t);
+  h.ctx.voice = { protocolVersion: 1, registerProvider: () => assert.fail('must not install transcript provider in desktop mode') };
+  await h.emit('session_start'); await h.run('');
+  assert.match(h.notices[0].message, /stepvoice.composer\/1/);
+});
+
+test('capability detection rejects wrong protocol, surface and missing methods', () => {
+  for (const candidate of [undefined, {}, { voiceComposer: {} }, { voiceComposer: { protocol: 'v1' } },
+    { voiceComposer: { protocol: COMPOSER_PROTOCOL, surface: 'overlay', registerProvider() {} } }]) {
+    assert.equal(getComposerVoiceHost(candidate), undefined);
+  }
+  const c = composer(); assert.equal(getComposerVoiceHost({ voiceComposer: c.capability }), c.capability);
+});
+
+test('supported composer registers once, opens without capture, and keeps every command in host UI', async t => {
+  const c = composer(), h = host(t, c.capability); await h.emit('session_start');
+  assert.equal(c.registrations.length, 1); assert.equal(c.actions.length, 0);
+  assert.equal(c.registrations[0].provider.capabilities.inputMode, 'handoff');
+  assert.equal(typeof c.registrations[0].provider.speak, 'function');
+  assert.deepEqual(Object.keys(c.registrations[0].configuration).sort(), ['clear', 'save', 'snapshot']);
+  for (const action of ['', 'panel', 'start', 'mute', 'interrupt', 'end', 'setup', 'status']) await h.run(action);
+  assert.deepEqual(c.actions, ['open', 'open', 'start', 'mute', 'interrupt', 'end', 'setup', 'status']);
+  assert.equal(c.registrations.length, 1); assert.equal(h.notices.length, 0);
+  await h.emit('agent_start'); assert.equal(c.closes, 0, 'host work must not hide composer controls');
+});
+
+test('stop unregisters, a later open registers anew, shutdown retires provider', async t => {
+  const c = composer(), h = host(t, c.capability); await h.run('');
+  const first = c.registrations[0].provider;
+  await h.run('stop'); assert.equal(c.closes, 1);
+  assert.throws(() => first.createSession({}), /已关闭/);
+  await h.run(''); assert.equal(c.registrations.length, 2);
+  await h.emit('session_shutdown'); assert.equal(c.closes, 2);
+  await h.run('start'); assert.equal(c.actions.filter(a => a === 'start').length, 0);
+});
+
+test('session identity changes cannot reuse the old composer registration', async t => {
+  const c = composer(), h = host(t, c.capability); await h.run('');
+  h.ctx.sessionManager.getSessionId = () => 'different-session';
+  await h.run('start');
+  assert.match(h.notices.at(-1).message, /旧会话/); assert.deepEqual(c.actions, ['open']);
+});
+
+test('malformed host registration fails visibly instead of falling back', async t => {
+  const h = host(t, { protocol: COMPOSER_PROTOCOL, surface: 'composer', registerProvider: () => ({}) });
+  await h.run(''); assert.match(h.notices[0].message, /无效注册/);
+});
+
+test('command discovery preserves existing names and help does not start services', async t => {
+  const h = host(t); assert.deepEqual([...h.commands.keys()], ['stepvoice']);
+  assert.deepEqual(h.commands.get('stepvoice').getArgumentCompletions('').map(item => item.value),
     ['panel', 'setup', 'start', 'mute', 'interrupt', 'end', 'stop', 'status', 'config']);
-  assert.equal(r.execs.length, 0);
-});
-
-test('explicit /stepvoice panel opens controls without recording or credential prompts', async t => {
-  const r = rpcHost(t, { keyConfigured: false }); t.after(() => r.shutdown());
-  const pending = r.command.handler('panel', r.ctx);
-  await waitDialog(r);
-  assert.match(r.dialogs.at(-1).title, /Step Voice · 当前桌面会话/);
-  assert.match(r.dialogs.at(-1).title, /\/stepvoice setup/);
-  assert.doesNotMatch(r.dialogs.at(-1).title, /在语音面板按 Enter/);
-  assert.ok(r.dialogs.at(-1).items.includes('关闭（结束通话）'));
-  r.resolveCurrent('关闭（结束通话）');
-  await pending;
-  assert.equal(r.execs.length, 0);
-});
-
-test('desktop menu shows setup when Key missing and closes without starting capture', async t => {
-  const r = rpcHost(t, { keyConfigured: false }); t.after(() => r.shutdown());
-  const pending = r.command.handler('', r.ctx);
-  await waitDialog(r);
-  const menu = r.dialogs.at(-1);
-  assert.match(menu.title, /Key：未配置|Key 未配置/);
-  assert.ok(menu.items.includes('配置接入（未配置 Key）'));
-  r.resolveCurrent('关闭（结束通话）');
-  await pending;
-  assert.equal(r.execs.length, 0, 'no osascript/native launch');
-});
-
-test('menu actions map to controller without leaving dialogs and never spawn osascript for controls', async t => {
-  const r = rpcHost(t, { keyConfigured: true }); t.after(() => r.shutdown());
-  // keyConfigured=true so option is 开始语音
-  const pending = r.command.handler('', r.ctx);
-  await waitDialog(r);
-  let menu = r.dialogs.at(-1);
-  assert.ok(menu.items.includes('开始语音'));
-  assert.ok(menu.items.includes('刷新状态'));
-  // 刷新状态 reopens menu
-  r.resolveCurrent('刷新状态');
-  await waitDialog(r);
-  assert.ok(r.dialogs.at(-1).items.includes('开始语音'));
-  // 接入设置 opens setup dialog
-  r.resolveCurrent('接入设置');
-  await waitDialog(r);
-  assert.match(r.dialogs.at(-1).title, /接入设置/);
-  r.resolveCurrent('返回');
-  await waitDialog(r);
-  // back at main menu; close without call → nothing started
-  r.resolveCurrent('关闭（结束通话）');
-  await pending;
-  assert.equal(r.execs.filter(e => e.command.includes('osascript')).length, 0);
-});
-
-test('host turn start dismisses the dialog but keeps any call running; closing after refresh stops it', async t => {
-  const r = rpcHost(t, { keyConfigured: false }); t.after(() => r.shutdown());
-  const pending = r.command.handler('', r.ctx);
-  await waitDialog(r);
-  r.events.emit('agent_start', { type: 'agent_start' }, r.ctx);
-  await pending; // dismissed, no error
-  assert.ok(true);
-});
-
-test('setup without Key offers env and hidden osascript input; cancellation does not verify', async t => {
-  const r = rpcHost(t, { keyConfigured: false }); t.after(() => r.shutdown());
-  const pending = r.command.handler('setup', r.ctx);
-  await waitDialog(r);
-  const channelDialog = r.dialogs.at(-1);
-  assert.match(channelDialog.title, /接入设置/);
-  r.resolveCurrent('开放平台 API（按调用量计费）');
-  await waitDialog(r);
-  const keyDialog = r.dialogs.at(-1);
-  assert.ok(keyDialog.items.some(i => i.includes('隐藏输入框')));
-  assert.ok(keyDialog.items.some(i => i.includes('环境变量')));
-  r.resolveCurrent('粘贴输入新 Key（macOS 隐藏输入框）');
-  await pending; // osascript mock returns code 1 (cancelled) → setup exits quietly
-  assert.equal(r.execs.at(-1)?.command, '/usr/bin/osascript');
-  assert.match(r.execs.at(-1)?.args.join(' '), /hidden answer/);
-});
-
-test('muted and active states label the menu; end stops the call', async t => {
-  const r = rpcHost(t, { keyConfigured: true }); t.after(() => r.shutdown());
-  const pending = r.command.handler('mute', r.ctx); await pending; // controller exists now
-  const menu = r.command.handler('', r.ctx);
-  await waitDialog(r);
-  assert.ok(r.dialogs.at(-1).items.includes('开始语音'));
-  r.resolveCurrent('关闭（结束通话）');
-  await menu;
-});
-
-test('missing-Key primary action opens channel setup instead of repeating the menu', async t => {
-  const r = rpcHost(t, { keyConfigured: false }); t.after(() => r.shutdown());
-  const pending = r.command.handler('', r.ctx);
-  await waitDialog(r);
-  r.resolveCurrent('配置接入（未配置 Key）');
-  await waitDialog(r);
-  assert.match(r.dialogs.at(-1).title, /选择接入通道/);
-  r.resolveCurrent('返回');
-  await waitDialog(r);
-  r.resolveCurrent('关闭（结束通话）');
-  await pending;
-  assert.equal(r.execs.length, 0);
+  await h.run('config'); assert.match(h.notices[0].message, /输入栏扩展协议/);
+  await h.run('unknown'); assert.match(h.notices[1].message, /用法/);
 });

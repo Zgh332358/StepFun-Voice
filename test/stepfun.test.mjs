@@ -8,6 +8,7 @@ import {
 	readSseEvents,
 	sanitizeProviderError,
 	StepFunRealtimeClient,
+	VOICE_TOOLS,
 	summarizeForSpeech,
 	synthesizeSpeech,
 	transcribeAudio,
@@ -59,6 +60,25 @@ async function connected(options = {}) {
 	await ready;
 	return { client, events, socket: client.socket };
 }
+
+test('conversation tool subsets reject unavailable tools and bound the deduplication ledger', async () => {
+  let calls = 0;
+  const { client, socket, events } = await connected({ tools: VOICE_TOOLS.filter(t => t.function.name === 'stepcode_task'), maxToolCalls: 2,
+    onToolCall: async () => { calls++; return { status: 'submitted' }; } });
+  assert.equal(socket.sent[0].session.tools.length, 1);
+  socket.receive({ type: 'response.function_call_arguments.done', call_id: 'cancel', name: 'stepcode_cancel', arguments: '{}' });
+  socket.receive({ type: 'response.function_call_arguments.done', call_id: 'one', name: 'stepcode_task', arguments: '{"instruction":"test"}' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+  socket.receive({ type: 'response.function_call_arguments.done', call_id: 'limit', name: 'stepcode_task', arguments: '{"instruction":"test"}' });
+  assert.equal(socket.readyState, 3); assert.ok(events.some(e => e.code === 'tool_limit'));
+  client.close();
+});
+
+test('partial input transcripts stay display-only normalized input events', () => {
+  const e = normalizeRealtimeEvent({ type: 'conversation.item.input_audio_transcription.delta', item_id: 'i', content_index: 0, delta: '检查' });
+  assert.equal(e.type, 'input.transcript.delta'); assert.equal(e.source, 'user_audio'); assert.equal(e.text, '检查');
+});
 
 test('transcription-only client forwards native identity and never executes tools or cancels generated output', async () => {
 	let tools = 0;

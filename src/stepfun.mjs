@@ -118,7 +118,7 @@ export function loadStepFunConfig(env = process.env, { saved = env === process.e
 }
 
 /** StepFun uses nested function definitions, unlike the OpenAI Realtime shape. */
-export function createRealtimeSession(config, { delegate = false } = {}) {
+export function createRealtimeSession(config, { delegate = false, tools = VOICE_TOOLS } = {}) {
 	return {
 		modalities: ["text", "audio"],
 		instructions: config.instructions || DEFAULT_INSTRUCTIONS,
@@ -126,7 +126,7 @@ export function createRealtimeSession(config, { delegate = false } = {}) {
 		input_audio_format: "pcm16",
 		output_audio_format: "pcm16",
 		turn_detection: config.turnDetection ?? null,
-		tools: delegate ? structuredClone(VOICE_TOOLS) : [],
+		tools: delegate ? structuredClone(tools) : [],
 	};
 }
 
@@ -210,6 +210,8 @@ export function normalizeRealtimeEvent(event, { apiKey = "" } = {}) {
 			return { type: "speech.end", ...ids, source: "user_audio", audioEndMs: event.audio_end_ms };
 		case "input_audio_buffer.committed":
 			return { type: "input.committed", ...ids, previousItemId: event.previous_item_id, source: "user_audio" };
+		case "conversation.item.input_audio_transcription.delta":
+			return { type: "input.transcript.delta", ...ids, contentIndex: event.content_index, source: "user_audio", text: typeof event.delta === "string" ? event.delta : "" };
 		case "conversation.item.input_audio_transcription.completed":
 			return { type: "input.transcript.final", ...ids, contentIndex: event.content_index, source: "user_audio", text: typeof event.transcript === "string" ? event.transcript : "" };
 		case "conversation.item.input_audio_transcription.failed":
@@ -269,10 +271,11 @@ export function normalizeRealtimeEvent(event, { apiKey = "" } = {}) {
 	}
 }
 
-function toolArgumentError(event) {
-	if (!event.callId) return "工具调用缺少 call_id。";
-	if (!VOICE_TOOLS.some((tool) => tool.function.name === event.name)) return "模型请求了未注册的工具。";
+export function toolArgumentError(event, tools = VOICE_TOOLS) {
+	if (typeof event?.callId !== 'string' || !event.callId.trim() || event.callId.length > 160) return "工具调用缺少有效 call_id。";
+	if (!tools.some((tool) => tool.function.name === event.name)) return "模型请求了未注册的工具。";
 	const args = event.arguments;
+	if (!args || typeof args !== 'object' || Array.isArray(args)) return "工具参数必须是对象。";
 	if (event.name === "stepcode_task") {
 		if (typeof args.instruction !== "string" || !args.instruction.trim() || args.instruction.length > 4_000) {
 			return "任务 instruction 必须是非空文本，且不能超过 4000 字符。";
@@ -285,13 +288,15 @@ function toolArgumentError(event) {
 
 /** Server-side WebSocket relay client. Pass the ws constructor; keys stay out of public event snapshots. */
 export class StepFunRealtimeClient {
-	constructor(config, { WebSocketImpl, onEvent = () => {}, onToolCall, delegate = false, autoBargeIn = true } = {}) {
+	constructor(config, { WebSocketImpl, onEvent = () => {}, onToolCall, delegate = false, autoBargeIn = true, tools = VOICE_TOOLS, maxToolCalls = 2048 } = {}) {
 		if (typeof WebSocketImpl !== "function") throw new Error("需要服务端 WebSocketImpl（ws），以便通过请求头鉴权。");
 		this.config = config;
 		this.WebSocketImpl = WebSocketImpl;
 		this.onEvent = onEvent;
 		this.onToolCall = onToolCall;
 		this.delegate = delegate;
+		this.tools = structuredClone(tools);
+		this.maxToolCalls = maxToolCalls;
 		this.autoBargeIn = autoBargeIn;
 		this.activeResponseId = null;
 		this.responseActive = false;
@@ -334,7 +339,7 @@ export class StepFunRealtimeClient {
 				return;
 			}
 			this.socket.on("open", () => {
-				this.send({ type: "session.update", session: createRealtimeSession(this.config, { delegate: this.delegate }) });
+				this.send({ type: "session.update", session: createRealtimeSession(this.config, { delegate: this.delegate, tools: this.tools }) });
 			});
 			this.socket.on("message", (data) => {
 				let raw;
@@ -407,8 +412,9 @@ export class StepFunRealtimeClient {
 	}
 
 	/** A background notification is system context, never a fabricated user turn. */
-	sendContext(text, { respond = true } = {}) {
-		this.addTextMessage("system", text);
+	sendContext(text, { respond = true, role = "system" } = {}) {
+		if (!["system", "user"].includes(role)) throw new Error("无效的上下文角色。");
+		this.addTextMessage(role, text);
 		if (respond) this.send({ type: "response.create" });
 	}
 
@@ -490,11 +496,15 @@ export class StepFunRealtimeClient {
 		if (event.type.startsWith("output.") && fenced) return;
 		if (event.type === "tool.invalid" || event.type === "tool.call") {
 			if (this.handledToolCalls.has(event.callId)) return;
+			if (this.handledToolCalls.size >= this.maxToolCalls) {
+				this.onEvent({ type: "error", code: "tool_limit", message: "本次语音工具请求过多，请重新开始通话。" });
+				this.close(); return;
+			}
 			// IDs remain deduplicated throughout the API's at-most-30-minute session.
 			// Evicting old IDs would permit a replay to execute a host task twice.
 			if (event.callId) this.handledToolCalls.add(event.callId);
 			if (fenced) return;
-			const invalid = event.type === "tool.invalid" ? event.message : toolArgumentError(event);
+			const invalid = event.type === "tool.invalid" ? event.message : toolArgumentError(event, this.tools);
 			if (invalid) {
 				this.onEvent({ type: "error", code: "invalid_tool_arguments", message: invalid });
 				if (event.callId) this.submitToolResult(event.callId, { error: invalid });

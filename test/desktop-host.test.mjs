@@ -12,7 +12,7 @@ import vm from 'node:vm';
 const hostRoot = process.env.STEP_CODE_HOST;
 const hostTest = hostRoot ? test : test.skip;
 
-hostTest('real desktop host dispatches /stepvoice into an in-app dialog menu without browser or model turn', async t => {
+hostTest('real desktop host reports the missing composer capability without a dialog or model turn', async t => {
   const coding = pathToFileURL(join(hostRoot, 'coding-agent/dist/index.js')).href;
   const { SelectionBroker, selectionSelect } = await import(pathToFileURL(join(hostRoot, 'web/dist/selection.js')).href);
   const h = await import(coding);
@@ -49,25 +49,19 @@ hostTest('real desktop host dispatches /stepvoice into an in-app dialog menu wit
     await session._extensionRunner.emit({ type: 'session_shutdown', reason: 'test' });
     session.dispose();
   });
+  const notices = [];
   await session.bindExtensions({ mode: 'rpc', uiContext: { select: selectionSelect(broker),
-    notify() { assert.fail('real RPC flow must not depend on notify'); } } });
+    notify(message) { notices.push(message); } } });
   const countBefore = manager.getEntries().filter(e => e.type === 'message').length;
-  for (const command of ['/stepvoice', '/stepvoice panel']) {
+  for (const command of ['/stepvoice', '/stepvoice panel', '/stepvoice setup', '/stepvoice start']) {
     selected = undefined;
-    const open = session.prompt(command, { source: 'rpc' });
-    for (let i = 0; i < 100 && !selected; i++) await new Promise(resolve => setTimeout(resolve, 10));
-    assert.ok(selected, `AgentSession must dispatch ${command} into the real selection broker`);
-    assert.match(selected.title, /Step Voice · 当前桌面会话/);
-    assert.ok(selected.options.includes('配置接入（未配置 Key）'), 'menu shows setup without Key');
-    assert.ok(selected.options.includes('关闭（结束通话）'));
-    assert.ok(selected.options.includes('接入设置'));
-    assert.doesNotMatch(selected.title + selected.options.join(), /http:\/\/|浏览器/);
-    assert.equal(broker.pendingRequests().length, 1);
-    broker.respond(selected.id, '关闭（结束通话）');
-    await open;
+    await session.prompt(command, { source: 'rpc' });
+    assert.equal(selected, undefined, `${command} must not open a blocking host dialog`);
     assert.equal(manager.getEntries().filter(e => e.type === 'message').length, countBefore);
     assert.equal(broker.pendingRequests().length, 0);
+    assert.match(notices.at(-1), /未提供输入栏语音插件接口/);
   }
+  await session.prompt('/stepvoice stop', { source: 'rpc' });
 });
 
 hostTest('bare /stepvoice avoids the old voice skill collision in the installed desktop menu', async () => {

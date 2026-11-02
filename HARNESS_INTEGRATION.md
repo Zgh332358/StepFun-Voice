@@ -1,12 +1,14 @@
 # Harness 级语音接入（开发版）
 
+> 本文描述旧 `ctx.voice` / Voice v1 的**终端直送协议**。从 0.2.0-dev.1 起，桌面路径另用 [composer 契约提案](COMPOSER_HOST_CONTRACT.md)：实时对话 provider + 独立 TTS + 宿主输入栏组件。当前正式宿主未实现该提案时只提示，不再启动浮窗或 relay。两种协议不要混用。
+
 ## 当前交付边界
 
 这次把语音的会话生命周期、转写顺序与去重、任务接收确认、结果回流移到了
 StepCode 的 `AgentSession`。Step Voice 保留 StepFun 协议、接入设置、音频和界面适配。
 
-- 宿主支持 `ctx.voice?.protocolVersion === 1`：注册 StepFun provider，使用进程内连接，不再启动插件本地 relay。
-- 旧宿主没有该能力：保留现有插件路径；这不等于旧宿主已获得新接口。
+- 终端宿主支持 `ctx.voice?.protocolVersion === 1`：注册直送 StepFun provider，使用进程内连接，不再启动插件本地 relay。
+- 终端旧宿主没有该能力：保留终端原插件路径；桌面不在此处回落。
 - 宿主修改需要包含配套补丁的独立 Step-Code 源码。仅更新这个插件不会升级已安装的 StepCode。
 - 当前公开 Step-Code 仓库不含桌面 Web/Electron 客户端。这里没有修改签名应用包，也没有把浏览器演示页当作桌面原生面板。
 
@@ -89,8 +91,7 @@ STEP_CODE_VOICE_SOURCE=/path/to/patched-Step-Code npm run check:types
 
 ## 仍需完成的桌面接入
 
-需要桌面客户端源码，才能把常驻控件、AudioWorklet/播放器、会话切换与上述 API 接起来。
-旧宿主的选择弹窗仅保留为兼容入口，不是新的原生桌面 UI。
+需要桌面客户端源码或宿主维护方实现 [composer 契约](COMPOSER_HOST_CONTRACT.md)，才能把输入栏组件、页面 AudioWorklet/播放器、会话切换与新对话 provider 接起来。0.1.7 曾尝试 AppKit 浮窗；0.2.0-dev.1 已退出该默认路径，不把它作为宿主 UI 接口的替代。
 
 自动化使用假音频和模型，不代表真人中文识别、声学回声、长时间录音、设备切换、
 实际延迟或线上模型可用性已经验收。现有字幕高亮仍按接收音频长度估算，不能视为

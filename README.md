@@ -6,60 +6,64 @@
 
 > **本分支（`main`）是 macOS 版**（Swift 音频助手）。Windows 版在 `windows` 分支（C#/WinMM 音频助手），两个分支并存、互不覆盖，安装时 Windows 需加 `@windows` ref。
 
-Step Voice 是为**当前 StepCode 会话**提供语音输入与结果朗读的独立插件，支持 macOS 终端和桌面端。
+Step Voice 是为**当前 StepCode 会话**提供语音交互的独立插件。终端保留原语音直送；桌面正在迁移到输入栏组件接入。
 
-**当前插件版本：0.1.6。** 正式桌面兼容性已在 StepCode **0.2.1（0.2.1.639）** 上验证：使用命令和壳内选择弹窗，不修改 `StepCode.app`，不另起编码 Agent。
+**当前源码版本：0.2.0-dev.1（未发布）。** 插件端已实现实时对话 provider、任务交接和独立 TTS；桌面输入栏需要宿主实现 `stepvoice.composer/1` 契约。**当前正式 StepCode 0.2.1 尚未实现此接口，所以安装本开发版不会出现新的语音控件。**
 
-| 运行环境 | 界面与接入方式 |
+| 运行环境 | 当前行为 |
 | --- | --- |
-| macOS 终端 | TUI 面板、字幕、电平与快捷键 |
-| 正式 StepCode 桌面端 | `/stepvoice` 打开选择弹窗；状态与字幕通过“刷新状态”查看 |
-| 带 Voice v1 补丁的开发宿主 | 可选进程内接入；不是正式版已具备的能力 |
+| macOS 终端 | 原有 TUI、语音转写直送、结果朗读 |
+| 正式 StepCode 桌面端 | `/stepvoice` 显示缺少输入栏接口的通知，不启动浮窗、Swift 麦克风或 relay |
+| 带 Voice v1 补丁的开发宿主 | 终端可用进程内直送路径；Voice v1 不等于桌面 composer 接口 |
+| 实现 composer 契约的宿主 | 注册 provider，控件/采集/播放由宿主拥有；目前只以离线契约测试验证 |
 
-**普通插件不提供常驻桌面侧栏。** 独立测试副本中的常驻 UI 依赖宿主改动，不随此仓库安装。当前版本的自动化检查不替代真实麦克风、中文识别和线上 TTS 验收。
+项目继续以插件交付，不修改签名 App、不注入页面、不读取宿主 cookie。旧浮窗源文件保留用于历史回归，但已退出默认桌面入口。已安装的 0.1.7 不会自动更新。
+
+[宿主接入契约](COMPOSER_HOST_CONTRACT.md) · [架构重启方案](VOICE_ARCHITECTURE_RESTART.md)
 
 **0.1.6 命令迁移：** 入口从 `/voice` 改为 **`/stepvoice`**，旧命令不再注册，所有子命令保留。更新插件后请重启 StepCode；仍加载 0.1.5 的进程不会自动获得新入口。
 
 ## 主要功能
 
-- **语音直送**：说话 → StepFun Realtime 转写 → 原文直接提交当前 Step Code（忙时 followUp 排队）。不经意图分类、不代替 Step Code 完成任务。
-- **结果朗读**：任务完成后，用 LLM 把真实输出总结成目标 80 字的口语化摘要，再以自适应语速 TTS 朗读；面板显示字幕，高亮目前按接收到的音频长度估算，不是播放器逐字对齐。
-- **宿主级接入（开发版）**：支持 Voice v1 的宿主统一管理语音会话、转写接收和任务关联；旧宿主保留兼容插件路径。详见 [Harness 接入说明](HARNESS_INTEGRATION.md)。
-- **状态反馈**：显示电平、提交/排队状态和错误。当前直送模式丢弃 Realtime 模型自己的回复事件，结果播报走宿主输出后的独立 TTS。
+- **新对话 provider（待宿主接入）**：实时音频/字幕与任务交接分开；只通过 handoff 执行任务，普通转写不再重复提交。任务进度/结果回流语音模型，打断输出不取消任务。
+- **新独立 TTS（待宿主接入）**：没有麦克风或 Realtime 连接也可朗读；可取消并丢弃晚到音频，与实时对话输出互斥。
+- **终端语音直送**：说话 → StepFun Realtime 转写 → 原文直接提交当前 StepCode（忙时 followUp 排队）。
+- **终端结果朗读**：任务完成后生成简短摘要并流式 TTS；保留旧的字幕估算，不宣称精确逐字对齐。
+- **原 Voice v1**：仍可用于本地开发宿主的终端路径，详见 [Harness 接入说明](HARNESS_INTEGRATION.md)。
 
-**停顿就是提交边界**（默认 VAD 静音阈值 450 ms），请一次说完一条指令。需要暂停输入时用 `/stepvoice mute`；取消编码任务和权限确认使用 StepCode 主界面的原有操作，终端可用 Ctrl+G。
+终端直送模式下**停顿就是提交边界**（默认 VAD 静音阈值 450 ms）。新对话模式下转写只做展示/上下文，任务以 handoff 接收回执为准。取消任务和权限确认始终使用 StepCode 原有机制。
 
-## 快速开始：正式 macOS 桌面版
+## 快速开始：先确认宿主能力
 
-需要已安装 StepCode、Node.js ≥ 22.19、Git 和 Xcode Command Line Tools。
+需要 Node.js ≥ 22.19、Git、StepCode；仅终端原生音频需要 Xcode Command Line Tools。
 
 ```bash
-# 安装到用户范围，供正式桌面端和终端使用
+# 此命令安装远端版本，不包含尚未发布的本地开发改动
 step install git:github.com/Zgh332358/StepFun-Voice
 ```
 
-1. 保存当前工作，退出并重新打开正式 StepCode。
-2. 在聊天输入框发送 **`/stepvoice`**，打开语音控制弹窗；此时不会录音或调用语音模型。
-3. 首次接入运行 **`/stepvoice setup`**，选择通道，并在 macOS 隐藏输入框中输入 Key。不要把 Key 发到聊天里；此步骤会在线验证，可能消耗额度。
-4. 主动选择“开始语音”或发送 `/stepvoice start`，按系统提示授权麦克风。
-5. 用 `/stepvoice mute` 暂停输入、`/stepvoice interrupt` 打断朗读、`/stepvoice end` 结束通话。
+- **当前正式桌面**：新开发版只给出接口缺失通知，不建议为试浮窗而覆盖旧安装。已有内置听写按钮与本插件独立。
+- **宿主维护方**：按照 [composer 契约](COMPOSER_HOST_CONTRACT.md) 实现输入栏挂载、页面采播、任务接收与事件回流，再接入插件 provider。
+- **终端用户**：运行 `step` 后用 `/stepvoice setup` 配置接入，再明确开始语音。设置验证可能消耗额度，不要把 Key 发到聊天里。
 
-只想在一个项目使用时，在该项目目录安装并添加 `-l`。如果已经通过本地目录安装，先用 `step list` 确认来源，不要再装一份相同插件；更新方式见[管理安装](#管理安装)。
+先用 `step list` 确认安装来源，不要叠加同 ID 插件。插件文件更新后需要宿主重载/重启，但重启不会凭空增加宿主缺失的能力。
 
 [桌面使用说明](FORMAL_DESKTOP.md) · [安装与启动](#安装与启动) · [环境变量](#环境变量与-stepfun-模型) · [排障](#排障指南) · [测试与验证范围](#测试与验证范围)
 
 ## 技术路径
 
-支持 `ctx.voice.protocolVersion === 1` 时，控制器使用进程内 transport 接入宿主的语音会话服务；顺序、去重、真实接收确认与朗读调度由宿主负责，不启动下面的本地 relay。配套宿主补丁需在独立源码中构建，仅更新插件不会升级已安装应用。
+终端支持 `ctx.voice.protocolVersion === 1` 时，控制器使用进程内 transport；否则保留终端本地 relay。桌面只探测独立的 `ctx.voiceComposer`，不把 Voice v1 当成页面音频接口。
 
-下图是**正式版兼容路径**（终端面板和桌面弹窗共用音频控制器）：
+新桌面路径：宿主输入栏/页面音频 → composer 契约 → `conversationProvider` → StepFun Realtime；任务通过宿主 `requestTask` 接收，进度通过 `updateTask` 回流。独立朗读走 `provider.speak`，不打开麦克风。宿主实现部分尚未交付，详见 [接入契约](COMPOSER_HOST_CONTRACT.md)。
+
+下图是**保留的终端直送路径**，不是当前桌面实现：
 
 ```mermaid
 flowchart TB
   subgraph T["插件进程（macOS）"]
     MIC["麦克风"] --> SW["Swift 音频助手 native/VoiceAudio.swift\n采集 PCM16 24kHz · 播放 · 电平表 · 3 秒无输入看门狗"]
     SW -- "JSONL：audio / level / playback" --> CTRL["终端控制器 terminal-controller.ts\n状态机 · 播放 fence · 回声 duck · 事件分发"]
-    CTRL --> UI["终端面板 / 桌面选择弹窗\n字幕 · 电平 · 任务状态"]
+    CTRL --> UI["终端面板\n字幕 · 电平 · 任务状态"]
   end
   subgraph P["本地插件服务 server.mjs（仅监听 127.0.0.1）"]
     SERVER["relay：鉴权 · 转写顺序与去重 · Key 脱敏 · TTS 调度"]
@@ -85,6 +89,10 @@ flowchart TB
 | `src/terminal-controller.ts` | 语音控制器：状态机、音频适配器、播放 fence、回声 duck、事件分发、TTS 朗读字幕时钟 |
 | `src/server.mjs` | 本地 relay（仅 127.0.0.1）：鉴权、转写顺序/去重、TTS 朗读与总结调度 |
 | `src/stepfun.mjs` | StepFun 客户端：Realtime WS 协议、`synthesizeSpeech`、`summarizeForSpeech`、事件归一化 |
+| `src/composer-contract.ts` | 待宿主实现的输入栏契约、类型与能力探测；不是正式版现有 API |
+| `src/conversation-provider.mjs` | 实时对话、handoff admission/去重、任务进度回流、输出打断 |
+| `src/readout-service.mjs` | 不依赖麦克风和 Realtime 连接的独立摘要/TTS、取消与输出 fencing |
+| `src/native-hud.mjs` / `native/VoiceHUD.swift` | 旧版浮窗代码，仅保留历史回归；不被新桌面入口调用 |
 | `src/native-audio.mjs` | 音频助手生命周期：按源码摘要本地编译 Swift 二进制、JSONL IPC |
 | `native/VoiceAudio.swift` | macOS 采集/播放/电平/看门狗（AVAudioEngine，编译时内嵌 Info.plist） |
 | `src/bridge.ts` | 宿主桥接：`sendUserMessage`、agent 事件快照 |
@@ -204,29 +212,28 @@ node scripts/package-plugin.mjs
 
 ## macOS 桌面端
 
-桌面端（StepCode.app）以 `rpc` 模式加载同一套扩展。当前宿主没有自定义侧栏/面板接口，本插件使用宿主原生的**选择弹窗**实现壳内语音控制：全程留在 StepCode 窗口，不打开浏览器，不另起 Agent，任务与权限仍归当前会话。
+桌面插件保持独立安装/卸载，不修改 StepCode.app。当前开发版仅接入 `stepvoice.composer/1` 提案，类型与说明见 [COMPOSER_HOST_CONTRACT.md](COMPOSER_HOST_CONTRACT.md)。
 
-### 使用
+### 当前正式宿主的实际行为
 
-正式版兼容包 `0.1.6` 使用现有扩展 API，不修改 StepCode.app，也不提供测试副本的常驻面板。安装、更新及验证范围见 [正式桌面版使用说明](FORMAL_DESKTOP.md)。
+- `/stepvoice`、`panel`、`start`、`setup` 等只通知“宿主未提供输入栏语音插件接口”。不启动 HUD、原生麦克风或 localhost relay。
+- `/stepvoice config` 说明接入前提；`stop` 清理已有插件资源。
+- 这不是麦克风权限错误，不应让用户反复去系统设置找开关；重启或重装也不会补齐该接口。
 
-1. 在桌面聊天输入框发送 **`/stepvoice`** 打开语音控制弹窗，**不会开始录音**。`/stepvoice panel` 与它同效；新入口避开旧 `/voice` 与 `Voice Of Customer Miner` 的补全冲突。
-2. 弹窗选项：
-   - **开始语音**：启动本机麦克风（首次按 macOS 提示授权）；停顿后最终转写直接提交当前任务，忙时排队。
-   - **静音/恢复麦克风**、**打断朗读/语音回复**、**结束通话**、**刷新状态**、**接入设置**、**关闭（结束通话）**。
-3. 弹窗内显示语音状态、接入通道、Key 状态、当前任务状态与最近字幕/输出摘要；选择“刷新状态”更新。
-4. `/stepvoice start|mute|interrupt|end|stop|status|config` 仍可直接执行，适合通话中宿主正在运行时快速控制。
-5. 宿主开始任务或出现权限/交互提示时，语音弹窗自动让出焦点；通话保持进行，重新发送 `/stepvoice` 可回到控制。工具权限确认始终在 StepCode 处理，插件不代为批准。
+### 宿主完成契约后的行为
 
-### 接入设置（无浏览器页面）
+1. provider 在 session_start 注册，主页面挂载输入栏入口；`/stepvoice` 只展开，不录音。
+2. 用户开始后，宿主负责页面采集和播放器，插件负责 StepFun 连接和事件适配。
+3. 普通字幕不提交任务；只有经过校验的 handoff 通过宿主 admission 接口提交一次。
+4. `mute`、`interrupt`、`end` 分别控制输入、语音输出和通话；停止编码任务仍用原宿主机制。
+5. `setup` 由宿主安全输入组件调用配置接口，Key 不进入聊天或模型上下文；更新/清除配置前必须结束对话/朗读。
+6. 独立 `provider.speak` 可在麦克风关闭时朗读，不与实时对话音频同时播放。
 
-`/stepvoice setup` 在壳内弹窗中完成：选择通道（开放平台 API / Step Plan）→ 选择 Key 来源（粘贴输入 / 环境变量 / 保留 / 清除）→ 实时验证后保存。桌面宿主没有密码输入框，“粘贴输入”调用 macOS 系统隐藏输入框（osascript hidden answer），Key 不进入聊天内容、模型上下文或命令日志。保存位置与终端一致：`~/.stepcode/step-voice/credentials.json`（仅当前用户可读）。
+### 验证边界
 
-### 边界
+输入栏挂载、浏览器设备采播、同源媒体桥、真实 admission adapter 尚未由正式宿主实现。离线契约测试验证的是插件行为，不是最终页面、中文输入法或真人语音效果。
 
-- 这是弹窗控制，不是持续常驻侧栏；查看字幕/电平用“刷新状态”。宿主后续版本提供面板 API 后可升级。
-- 弹窗空闲约 2 分钟自动关闭，未开始的采集不会残留；明确“关闭（结束通话）”会结束当前通话。
-- 同机 macOS 方案；Windows 分支未同步。真实录音与在线转写需授权后验收。
+历史 `npm run test:hud` 只测试旧浮窗，不是新架构的验收；主要使用完整离线回归、正式宿主能力缺失分支测试，以及未来宿主接入后的真机测试。
 
 ## 终端操作
 
@@ -365,7 +372,7 @@ npm test
 # 单独验证弹窗逻辑，不依赖 TUI 模块
 node --import ./test/offline-network.mjs --test test/desktop-dialog.test.mjs
 
-# 真正打开未修改的正式程序，在独立测试配置中检查插件弹窗
+# 真正打开未修改的正式程序，在独立测试配置中检查非模态入口和显式设置
 STEP_VOICE_PACKAGE="$PWD" node scripts/formal-desktop-smoke.mjs
 ```
 

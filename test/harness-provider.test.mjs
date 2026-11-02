@@ -93,6 +93,31 @@ test('a failed synthesizer rejects with credentials redacted instead of pretendi
   assert.deepEqual(outputs.map(e => e.type), ['output.subtitle.start', 'output.subtitle.end']);
 });
 
+test('composer readout uses the shared credential adapter without constructing any realtime client', async t => {
+  const outputs = [];
+  const f = fixture(t, { summarize: async () => '真实摘要', synthesizeSpeech: async (_, __, { onAudio }) => onAudio(Buffer.from([0, 0])) });
+  await f.runtime.conversationProvider.speak('真实输出', { sessionId: 'agent', voiceSessionId: 'readout', generation: 1,
+    signal: f.abort.signal, emit: e => outputs.push(e) });
+  assert.equal(f.clients.length, 0);
+  assert.ok(outputs.some(e => e.type === 'output.audio.delta'));
+});
+
+test('composer activity locks configuration and standalone readout respects verification in progress', async t => {
+  let finish;
+  const f = fixture(t, { verifyAccess: () => new Promise(resolve => { finish = resolve; }) });
+  const context = { sessionId: 'agent', voiceSessionId: 'voice', generation: 1, signal: f.abort.signal, emit() {},
+    requestTask: async () => ({ status: 'rejected' }), getTaskStatus: () => ({ busy: false, status: 'idle' }) };
+  const session = f.runtime.conversationProvider.createSession(context);
+  assert.throws(() => f.runtime.updateConfig({}), /先结束/);
+  assert.throws(() => f.runtime.clearCredentials(), /先结束/);
+  await assert.rejects(f.runtime.saveCredentials('api', 'test-offline-credentials'), /先结束/);
+  await session.close();
+  const saving = f.runtime.saveCredentials('api', 'test-offline-credentials');
+  assert.throws(() => f.runtime.conversationProvider.createSession(context), /正在验证/);
+  await assert.rejects(f.runtime.conversationProvider.speak('结果', context), /正在验证/);
+  finish({ ok: true }); assert.equal((await saving).ok, true);
+});
+
 test('a pre-canceled access verification opens neither HTTP nor WebSocket', async () => {
   const abort = new AbortController(); abort.abort();
   let requests = 0;

@@ -27,7 +27,7 @@ const copy = (source, target) => {
     cpSync(source, target);
   }
 };
-for (const path of ['index.ts', 'package-lock.json', 'step.plugin.json', 'README.md', 'FORMAL_DESKTOP.md', 'HARNESS_INTEGRATION.md', 'GITHUB.md', 'LICENSE', 'src', 'native']) {
+for (const path of ['index.ts', 'package-lock.json', 'step.plugin.json', 'README.md', 'FORMAL_DESKTOP.md', 'HARNESS_INTEGRATION.md', 'COMPOSER_HOST_CONTRACT.md', 'VOICE_ARCHITECTURE_RESTART.md', 'GITHUB.md', 'LICENSE', 'src', 'native']) {
   copy(join(root, path), join(destination, path));
 }
 const dependency = JSON.parse(readFileSync(join(root, 'node_modules/ws/package.json'), 'utf8'));

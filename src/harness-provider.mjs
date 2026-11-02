@@ -1,4 +1,5 @@
 import { WebSocket } from 'ws';
+import { createConversationProvider } from './conversation-provider.mjs';
 import { CHANNELS, clearCredentials, isChannel, keyHint, saveCredentials, validKeyShape } from './credentials.mjs';
 import { assertOfficialBaseUrl, loadStepFunConfig, sanitizeProviderError, StepFunRealtimeClient, summarizeForSpeech, synthesizeSpeech, verifyChannelAccess } from './stepfun.mjs';
 
@@ -15,6 +16,11 @@ export function createHarnessVoiceRuntime(options = {}) {
   const synthesize = options.synthesizeSpeech ?? synthesizeSpeech;
   const clientFactory = options.clientFactory ?? ((candidate, hooks) => new StepFunRealtimeClient(candidate, { ...hooks, WebSocketImpl: WebSocket }));
   const settings = { speakTasks: env.STEP_VOICE_SPEAK_TASKS !== '0', speakSummarize: env.STEP_VOICE_SUMMARY !== '0' };
+  const conversationProvider = createConversationProvider({ getConfig: () => {
+    assertActive();
+    if (checking) throw new Error('正在验证接入设置，请稍候。');
+    return currentConfig();
+  }, clientFactory, summarize, synthesize, summarizeEnabled: settings.speakSummarize });
   const assertActive = () => { if (disposed) throw new Error('语音适配器已随旧会话关闭。'); };
 
   function sanitizeEvent(value, apiKey = config?.apiKey) {
@@ -34,6 +40,7 @@ export function createHarnessVoiceRuntime(options = {}) {
 
   function updateConfig(input) {
     assertActive();
+    if (conversationProvider.active) throw new Error('请先结束实时语音或朗读，再修改接入设置。');
     if (checking) throw new Error('正在验证接入设置，请稍候。');
     const next = { ...currentConfig() };
     for (const name of ['baseUrl', 'realtimeModel', 'ttsModel', 'asrModel', 'voice']) {
@@ -54,6 +61,7 @@ export function createHarnessVoiceRuntime(options = {}) {
 
   async function save(channel, apiKey = '', useEnvKey = false) {
     assertActive();
+    if (conversationProvider.active) throw new Error('请先结束实时语音或朗读，再修改接入设置。');
     if (checking) throw new Error('正在验证上一个 Key，请稍候。');
     if (!isChannel(channel)) throw new Error('接入通道无效');
     const typed = typeof apiKey === 'string' ? apiKey.trim() : '';
@@ -161,10 +169,11 @@ export function createHarnessVoiceRuntime(options = {}) {
   }
 
   const provider = { id: 'stepfun', label: 'StepFun Realtime + TTS', createSession };
-  return { provider, publicConfig, settings, updateConfig, sanitizeEvent, saveCredentials: save,
+  return { provider, conversationProvider, publicConfig, settings, updateConfig, sanitizeEvent, saveCredentials: save,
     cancelSetup() { checking?.abort(); },
     clearCredentials() {
       assertActive();
+      if (conversationProvider.active) throw new Error('请先结束实时语音或朗读，再修改接入设置。');
       if (checking) throw new Error('请等待接入验证结束。');
       clearCredentials(env);
       config = loadStepFunConfig(env, { saved: undefined });
@@ -172,7 +181,7 @@ export function createHarnessVoiceRuntime(options = {}) {
     async dispose() {
       disposed = true;
       checking?.abort();
-      await Promise.all([...sessions].map(session => session.close()));
+      await Promise.all([conversationProvider.dispose(), ...[...sessions].map(session => session.close())]);
     },
   };
 }

@@ -14,7 +14,7 @@ step install git:github.com/Zgh332358/StepFun-Voice
 step install -l git:github.com/Zgh332358/StepFun-Voice
 ```
 
-二选一即可。安装后保存工作并重启 StepCode，然后发送 `/stepvoice`。需要接入设置时用 `/stepvoice setup`，不要把 Key 发到聊天里。打开弹窗不会录音；开始通话和在线验证均由你主动触发。
+二选一即可。安装后保存工作并重启 StepCode，然后发送 `/stepvoice`。**当前源码 0.2.0-dev.1 尚未发布，桌面需要宿主实现 `stepvoice.composer/1`；正式 0.2.1 上只通知能力缺失，不再打开浮窗。** GitHub 安装取决于远端版本，不包含未推送的本地修改。接入设置与真实语音调用均需用户主动触发，不要把 Key 发到聊天里。
 
 宿主负责下载仓库、安装 `ws` 运行依赖和保存扩展引用。`pi.extensions` 中的 `./index.ts` 是真实加载入口。无需 npm 账号；仓库的 `private: true` 防止误发 npm。
 

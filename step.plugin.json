@@ -1,7 +1,7 @@
 {
 	"id": "step-voice",
 	"name": "Step Voice",
-	"description": "StepFun voice for the current StepCode session: terminal panel or macOS desktop dialogs via /stepvoice, without modifying the host.",
-	"version": "0.1.6",
+	"description": "StepFun voice provider for StepCode: terminal support and proposed composer integration; no desktop HUD fallback.",
+	"version": "0.2.0-dev.1",
 	"entry": "index.ts"
 }
